@@ -215,6 +215,92 @@ impl BatchHasher {
         }
     }
 
+    /// Hash eight consecutive indices `g0..g0+8`, writing each 48-byte digest
+    /// into `out[0..8]`. Uses AVX-512 (one 8-wide BLAKE2b compression) when
+    /// available, else two AVX2 `hash4`s. Modern AMD (Zen4+) and Intel CPUs run
+    /// AVX-512 without the clock penalty older Intel parts had.
+    #[inline]
+    pub fn hash8(&self, g0: u32, out: &mut [[u8; HASH_OUTPUT]; 8]) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx512f") {
+                unsafe { self.hash8_avx512(g0, out) };
+                return;
+            }
+        }
+        // Fallback: two 4-lane batches into the two halves of `out`.
+        let (lo, hi) = out.split_at_mut(4);
+        self.hash4(g0, (&mut lo[..4]).try_into().unwrap());
+        self.hash4(g0 + 4, (&mut hi[..4]).try_into().unwrap());
+    }
+
+    /// Eight-lane BLAKE2b final-block compression (AVX-512). Same structure as
+    /// [`Self::hash4_avx2`] but 512-bit lanes and native 64-bit rotates.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn hash8_avx512(&self, g0: u32, out: &mut [[u8; HASH_OUTPUT]; 8]) {
+        use core::arch::x86_64::*;
+
+        #[inline(always)]
+        unsafe fn g8(
+            v: &mut [__m512i; 16],
+            a: usize, b: usize, c: usize, d: usize,
+            x: __m512i, y: __m512i,
+        ) {
+            v[a] = _mm512_add_epi64(_mm512_add_epi64(v[a], v[b]), x);
+            v[d] = _mm512_ror_epi64::<32>(_mm512_xor_si512(v[d], v[a]));
+            v[c] = _mm512_add_epi64(v[c], v[d]);
+            v[b] = _mm512_ror_epi64::<24>(_mm512_xor_si512(v[b], v[c]));
+            v[a] = _mm512_add_epi64(_mm512_add_epi64(v[a], v[b]), y);
+            v[d] = _mm512_ror_epi64::<16>(_mm512_xor_si512(v[d], v[a]));
+            v[c] = _mm512_add_epi64(v[c], v[d]);
+            v[b] = _mm512_ror_epi64::<63>(_mm512_xor_si512(v[b], v[c]));
+        }
+
+        // Only m0 and m1 are nonzero; m1's high 32 bits hold the per-lane `g`.
+        let tail0 = u64::from_le_bytes(self.tail[0..8].try_into().unwrap());
+        let tail_hi = u32::from_le_bytes(self.tail[8..12].try_into().unwrap()) as u64;
+        let m1 = |g: u32| (tail_hi | ((g as u64) << 32)) as i64;
+        let mut m = [_mm512_setzero_si512(); 16];
+        m[0] = _mm512_set1_epi64(tail0 as i64);
+        m[1] = _mm512_set_epi64(
+            m1(g0 + 7), m1(g0 + 6), m1(g0 + 5), m1(g0 + 4),
+            m1(g0 + 3), m1(g0 + 2), m1(g0 + 1), m1(g0),
+        );
+
+        let mut v = [_mm512_setzero_si512(); 16];
+        for i in 0..8 {
+            v[i] = _mm512_set1_epi64(self.mid[i] as i64);
+            v[i + 8] = _mm512_set1_epi64(IV[i] as i64);
+        }
+        v[12] = _mm512_xor_si512(v[12], _mm512_set1_epi64(FINAL_COUNT as i64));
+        v[14] = _mm512_xor_si512(v[14], _mm512_set1_epi64(-1)); // last-block flag
+
+        for s in &SIGMA {
+            g8(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+            g8(&mut v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+            g8(&mut v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+            g8(&mut v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+            g8(&mut v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+            g8(&mut v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+            g8(&mut v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+            g8(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
+        }
+
+        // h[i] = mid[i] ^ v[i] ^ v[i+8]; first HASH_OUTPUT/8 words per lane, LE.
+        let mut tmp = [0u64; 8];
+        for i in 0..HASH_OUTPUT / 8 {
+            let o = _mm512_xor_si512(
+                _mm512_xor_si512(_mm512_set1_epi64(self.mid[i] as i64), v[i]),
+                v[i + 8],
+            );
+            _mm512_storeu_si512(tmp.as_mut_ptr() as *mut _, o);
+            for l in 0..8 {
+                out[l][i * 8..i * 8 + 8].copy_from_slice(&tmp[l].to_le_bytes());
+            }
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn hash4_avx2(&self, g0: u32, out: &mut [[u8; HASH_OUTPUT]; 4]) {
@@ -314,6 +400,15 @@ mod tests {
             hasher.hash4(base_g, &mut out);
             for l in 0..4 {
                 assert_eq!(out[l], generate_hash(&base, base_g + l as u32), "hash4 mismatch at g={}", base_g + l as u32);
+            }
+        }
+
+        // hash8 (AVX-512 or hash4 fallback) must match for several batches.
+        for base_g in [0u32, 8, 64, 1_000_000] {
+            let mut out = [[0u8; HASH_OUTPUT]; 8];
+            hasher.hash8(base_g, &mut out);
+            for l in 0..8 {
+                assert_eq!(out[l], generate_hash(&base, base_g + l as u32), "hash8 mismatch at g={}", base_g + l as u32);
             }
         }
     }

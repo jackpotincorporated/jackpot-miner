@@ -438,7 +438,7 @@ fn low_group(
 /// Monomorphised over the XOR producer so the AVX2 intrinsics inline cleanly
 /// inside a `target_feature` wrapper while sharing one source of truth.
 macro_rules! emit_bucket_body {
-    ($keys_sorted:expr, $slots:expr, $sorted:expr, $kout:expr, $sout:expr, $pout:expr, $clamp:expr, $w_in:expr, $w_out:expr, $xor:path) => {{
+    ($keys_sorted:expr, $slots:expr, $sorted:expr, $kout:expr, $sout:expr, $pout:expr, $clamp:expr, $w_in:expr, $w_out:expr, $prefetch:expr, $xor:path) => {{
         let s = $sorted;
         let ks = $keys_sorted; // leading keys in `s`-order; group walk streams it
         let m = s.len();
@@ -453,6 +453,18 @@ macro_rules! emit_bucket_body {
                 j += 1;
             }
             let hi = j.min(i.saturating_add($clamp));
+            // The pair loops below read `slots[s[a]]` / `slots[s[b]]` at random
+            // global positions in the ~1 GB slot arena — each a likely cache
+            // miss. Prefetch this group's member slots up front so the misses
+            // overlap with the (L1-resident) pair XORs that follow.
+            #[cfg(target_arch = "x86_64")]
+            if $prefetch {
+                for a in i..hi {
+                    core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+                        $slots.as_ptr().add(s[a] as usize * w_in) as *const i8,
+                    );
+                }
+            }
             for a in i..hi {
                 let l = s[a] as usize;
                 for b in (a + 1)..hi {
@@ -484,8 +496,9 @@ unsafe fn emit_bucket_scalar(
     clamp: usize,
     w_in: usize,
     w_out: usize,
+    prefetch: bool,
 ) -> usize {
-    emit_bucket_body!(keys_sorted, slots, sorted, kout, sout, pout, clamp, w_in, w_out, xor_child_scalar)
+    emit_bucket_body!(keys_sorted, slots, sorted, kout, sout, pout, clamp, w_in, w_out, prefetch, xor_child_scalar)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -500,12 +513,14 @@ unsafe fn emit_bucket_avx2(
     clamp: usize,
     w_in: usize,
     w_out: usize,
+    prefetch: bool,
 ) -> usize {
-    emit_bucket_body!(keys_sorted, slots, sorted, kout, sout, pout, clamp, w_in, w_out, xor_child_avx2)
+    emit_bucket_body!(keys_sorted, slots, sorted, kout, sout, pout, clamp, w_in, w_out, prefetch, xor_child_avx2)
 }
 
 /// Emit a partition's children, dispatching to the AVX2 producer when available.
 /// `w_in`/`w_out` are the input/output slot pitches (`w_out == w_in - 1`).
+/// `prefetch` software-prefetches each group's randomly-gathered member slots.
 unsafe fn emit_bucket(
     keys_sorted: &[u32],
     slots: &[u32],
@@ -516,14 +531,15 @@ unsafe fn emit_bucket(
     clamp: usize,
     w_in: usize,
     w_out: usize,
+    prefetch: bool,
 ) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            return emit_bucket_avx2(keys_sorted, slots, sorted, kout, sout, pout, clamp, w_in, w_out);
+            return emit_bucket_avx2(keys_sorted, slots, sorted, kout, sout, pout, clamp, w_in, w_out, prefetch);
         }
     }
-    emit_bucket_scalar(keys_sorted, slots, sorted, kout, sout, pout, clamp, w_in, w_out)
+    emit_bucket_scalar(keys_sorted, slots, sorted, kout, sout, pout, clamp, w_in, w_out, prefetch)
 }
 
 /// Group `n` entries by their leading block, then emit one child per colliding
@@ -546,6 +562,9 @@ fn collide(
     // Sub-phase timing, gated on `EQ_PROFILE`. Prints partition / count / alloc /
     // emit splits so we can see which part of the round dominates.
     let prof = std::env::var_os("EQ_PROFILE").is_some();
+    // Software-prefetch the emit gather (on by default; `EQ_NO_PREFETCH` disables
+    // it for A/B benchmarking). Read once, not per group.
+    let do_prefetch = std::env::var_os("EQ_NO_PREFETCH").is_none();
     let t0 = std::time::Instant::now();
 
     let (starts, order, keys_part) = partition_top(keys, n);
@@ -609,8 +628,9 @@ fn collide(
             let mut sorted = Vec::new();
             let mut keys_sorted = Vec::new();
             low_group(&keys_part[lo..hi], &order[lo..hi], &mut hist, &mut sorted, &mut keys_sorted);
-            let w =
-                unsafe { emit_bucket(&keys_sorted, slots, &sorted, kout, sout, pout, clamp, w_in, w_out) };
+            let w = unsafe {
+                emit_bucket(&keys_sorted, slots, &sorted, kout, sout, pout, clamp, w_in, w_out, do_prefetch)
+            };
             debug_assert_eq!(w, kout.len());
         });
 
@@ -722,18 +742,29 @@ pub fn solve_with(header: &[u8], clamp: Option<usize>) -> Vec<Vec<u32>> {
     let hasher = BatchHasher::new(header);
     let mut keys: Vec<u32> = vec![0u32; n0];
     let mut slots: Vec<u32> = vec![0u32; n0 * SLOT];
-    let kgroup = 4 * INDICES_PER_HASH_OUTPUT; // eight entries
+    // Hash eight `g` values per chunk via `hash8`, which uses one AVX-512
+    // compression where available and falls back to two AVX2 `hash4`s (or scalar)
+    // otherwise — so this single path covers every CPU.
+    let kgroup = 8 * INDICES_PER_HASH_OUTPUT; // sixteen entries
     let sgroup = kgroup * SLOT;
-    debug_assert_eq!(n0 % kgroup, 0, "round-0 buffer must split into whole 4-g groups");
+    debug_assert_eq!(n0 % kgroup, 0, "round-0 buffer must split into whole 8-g groups");
+    // `EQ_NO_AVX512` forces the AVX2 fallback (two hash4) for A/B benchmarking.
+    let use_avx512 = std::env::var_os("EQ_NO_AVX512").is_none();
     slots
         .par_chunks_mut(sgroup)
         .zip(keys.par_chunks_mut(kgroup))
         .enumerate()
         .for_each(|(c, (schunk, kchunk))| {
-            let g0 = (c * 4) as u32;
-            let mut hs = [[0u8; HASH_OUTPUT]; 4];
-            hasher.hash4(g0, &mut hs);
-            for j in 0..4 {
+            let g0 = (c * 8) as u32;
+            let mut hs = [[0u8; HASH_OUTPUT]; 8];
+            if use_avx512 {
+                hasher.hash8(g0, &mut hs);
+            } else {
+                let (lo, hi) = hs.split_at_mut(4);
+                hasher.hash4(g0, (&mut lo[..4]).try_into().unwrap());
+                hasher.hash4(g0 + 4, (&mut hi[..4]).try_into().unwrap());
+            }
+            for j in 0..8 {
                 for i in 0..INDICES_PER_HASH_OUTPUT {
                     let e = j * INDICES_PER_HASH_OUTPUT + i;
                     let src = &hs[j][i * HASH_BYTES..i * HASH_BYTES + HASH_BYTES];
