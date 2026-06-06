@@ -2236,6 +2236,7 @@ dependencies = [
  "eframe",
  "env_logger",
  "hex",
+ "libloading 0.8.9",
  "log",
  "num_cpus",
  "ocl",

@@ -166,6 +166,18 @@ impl BatchHasher {
         Self { mid, tail }
     }
 
+    /// The BLAKE2b chaining state after compressing the shared first 128-byte
+    /// header block (the eight 64-bit midstate words). This is exactly the
+    /// `hashState` (`ulong8`) the OpenCL `equihash192_7.cl` round-0 kernel
+    /// consumes: it injects the final 16-byte block (message word `m[1] =
+    /// (index << 32) | nonce_low`, `m[0] = 0`) itself, which requires the
+    /// header's bytes [128..136] to be zero (the same `cuda_compatible` rule the
+    /// CUDA backend relies on). Only used by the OpenCL (AMD) backend.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    pub fn midstate(&self) -> [u64; 8] {
+        self.mid
+    }
+
     /// Assemble the zero-padded final block for index `g`.
     #[inline]
     fn final_block(&self, g: u32) -> [u8; 128] {

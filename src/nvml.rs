@@ -33,7 +33,15 @@ const NVML_CLOCK_MEM: c_int = 2;
 // nvmlTemperatureSensors_t
 const NVML_TEMPERATURE_GPU: c_int = 0;
 
-extern "C" {
+// NVML, loaded at runtime via dlopen (see `crate::dylib`) rather than linked at
+// build time — it ships with the NVIDIA driver (`libnvidia-ml.so.1`;
+// `nvml.dll` on Windows) and is absent on driver-less / AMD-only hosts.
+// `nvml_lib()` is `None` when it can't be opened; `open()` checks it first and
+// returns `None` (no tuning) so the rest of the program is unaffected.
+crate::dylib::dynamic_library! {
+    lib_struct: NvmlLib,
+    loader: nvml_lib,
+    names: ["libnvidia-ml.so.1", "libnvidia-ml.so", "nvml.dll"],
     fn nvmlInit_v2() -> nvmlReturn_t;
     fn nvmlShutdown() -> nvmlReturn_t;
     fn nvmlDeviceGetName(device: nvmlDevice_t, name: *mut c_char, length: c_uint) -> nvmlReturn_t;
@@ -69,6 +77,7 @@ unsafe impl Send for NvmlTuner {}
 
 /// Open an NVML control handle for the GPU at `pci_bus_id` (e.g. "0000:01:00.0").
 pub fn open(pci_bus_id: &str) -> Option<Box<dyn GpuTuner>> {
+    nvml_lib()?; // NVML not installed → no tuning
     let cstr = CString::new(pci_bus_id).ok()?;
     unsafe {
         if nvmlInit_v2() != NVML_SUCCESS {

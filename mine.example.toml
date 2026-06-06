@@ -23,9 +23,11 @@ user = "t1YourZClassicAddressHere.rig1"        # payout address / worker login
 # no-jackpot = true          # PPLNS
 
 # ── GPU backend ───────────────────────────────────────────────────────────────
-# backend      = "cuda"      # "cuda" or "opencl"
-# devices      = "all"       # "all", or a comma list e.g. "0,1"
-# force-opencl = false       # force OpenCL, disabling CUDA
+# backend      = "mixed"     # "mixed" (default: NVIDIA→CUDA, AMD/Intel→OpenCL),
+#                            # "opencl" (every card via OpenCL), or "cuda"
+# devices      = "all"       # "all", or a comma list e.g. "0,1" — in mixed mode
+#                            # these index the combined list from --list-devices
+# force-opencl = false       # force every card onto OpenCL, disabling CUDA
 
 # ── GPU tuning (clock/power changes need root) ────────────────────────────────
 # no-gpu-tune      = false

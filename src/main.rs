@@ -14,6 +14,14 @@ mod tui;
 #[cfg(feature = "gpu")]
 mod gpu;
 
+// AMD-tuned OpenCL kernel driver (selected by GpuSolver for AMD-vendor devices).
+#[cfg(feature = "gpu")]
+mod gpu_amd;
+
+// Runtime dynamic-library loader (dlopen) for the CUDA driver + NVML.
+#[cfg(feature = "cuda")]
+mod dylib;
+
 #[cfg(feature = "cuda")]
 mod cuda;
 
@@ -79,8 +87,9 @@ struct Args {
     jackpot: Option<u32>,
 
     /// Pause mining if no new job arrives within this many seconds (stale work
-    /// guard); resumes automatically when fresh work arrives. 0 disables.
-    #[arg(long, value_name = "SECS", default_value_t = 300)]
+    /// guard); resumes automatically when fresh work arrives. Default 600 (10
+    /// minutes). 0 disables.
+    #[arg(long, value_name = "SECS", default_value_t = 600)]
     job_timeout: u64,
 
     /// Open a local control server on 127.0.0.1:<PORT> so the GUI config tool can
@@ -139,8 +148,11 @@ struct Args {
     #[arg(long, default_value = "all")]
     devices: String,
 
-    /// GPU backend: "opencl" or "cuda" (for nvidia cards).
-    #[arg(long, default_value = "cuda")]
+    /// GPU backend: "mixed" (default — each card on its native backend: NVIDIA
+    /// on CUDA, AMD/Intel on OpenCL), "opencl" (every card via OpenCL), or
+    /// "cuda" (NVIDIA only). In mixed mode `--devices` indexes the combined list
+    /// shown by --list-devices.
+    #[arg(long, default_value = "mixed")]
     backend: String,
 
     /// Force the OpenCL backend, disabling CUDA (overrides --backend).
@@ -610,6 +622,9 @@ fn main() -> Result<()> {
 /// Which GPU backend the user selected.
 enum BackendKind {
     Cpu,
+    /// Each physical card on its native backend (NVIDIA→CUDA, others→OpenCL).
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
+    Mixed,
     #[cfg(feature = "gpu")]
     OpenCl,
     #[cfg(feature = "cuda")]
@@ -633,6 +648,16 @@ fn backend_kind(args: &Args) -> Result<BackendKind> {
         }
     }
     match args.backend.to_ascii_lowercase().as_str() {
+        "mixed" => {
+            // Each card on its native backend; falls back to whatever single GPU
+            // backend is compiled, or to CPU when none is.
+            #[cfg(any(feature = "gpu", feature = "cuda"))]
+            {
+                Ok(BackendKind::Mixed)
+            }
+            #[cfg(not(any(feature = "gpu", feature = "cuda")))]
+            Ok(BackendKind::Cpu)
+        }
         "cuda" => {
             #[cfg(feature = "cuda")]
             {
@@ -649,7 +674,7 @@ fn backend_kind(args: &Args) -> Result<BackendKind> {
             #[cfg(not(feature = "gpu"))]
             Ok(BackendKind::Cpu)
         }
-        other => Err(anyhow!("unknown --backend '{other}' (expected opencl or cuda)")),
+        other => Err(anyhow!("unknown --backend '{other}' (expected mixed, opencl, or cuda)")),
     }
 }
 
@@ -707,6 +732,8 @@ fn backend_specs(args: &Args, gpu_devices: &[GpuDeviceCfg]) -> Result<Vec<Backen
                 let clamp = (args.cpu_clamp != 0).then_some(args.cpu_clamp);
                 return Ok(vec![BackendSpec::Cpu(clamp)]);
             }
+            // Mixed builds its own unified list (each card on its native backend).
+            BackendKind::Mixed => return mixed_specs(args),
             #[cfg(feature = "cuda")]
             BackendKind::Cuda => (cuda::device_count()?, true),
             #[cfg(feature = "gpu")]
@@ -733,6 +760,71 @@ fn backend_specs(args: &Args, gpu_devices: &[GpuDeviceCfg]) -> Result<Vec<Backen
         let clamp = (args.cpu_clamp != 0).then_some(args.cpu_clamp);
         Ok(vec![BackendSpec::Cpu(clamp)])
     }
+}
+
+/// The unified device list for the `mixed` backend, as `(label, spec)`: each
+/// physical GPU on its native backend, with no card mined twice. NVIDIA cards go
+/// to CUDA (listed first); the remaining OpenCL devices (AMD/Intel, plus NVIDIA
+/// when CUDA is unavailable) go to OpenCL. Shared by [`mixed_specs`] and
+/// [`list_devices`]; `--devices` indexes into this list.
+#[cfg(any(feature = "gpu", feature = "cuda"))]
+fn mixed_plan() -> Vec<(String, BackendSpec)> {
+    /// Drop a leading `"[<n>] "` index prefix from a backend's device label, so
+    /// the mixed list shows its own single index instead of two.
+    fn strip_index(label: &str) -> &str {
+        label
+            .strip_prefix('[')
+            .and_then(|s| s.split_once("] "))
+            .map(|(_, rest)| rest)
+            .unwrap_or(label)
+    }
+
+    #[allow(unused_mut)]
+    let mut plan: Vec<(String, BackendSpec)> = Vec::new();
+
+    // NVIDIA cards via CUDA, when the backend is compiled and the driver loads.
+    #[cfg(feature = "cuda")]
+    let cuda_has_nvidia = {
+        let names = cuda::list_devices().unwrap_or_default();
+        for (i, label) in names.iter().enumerate() {
+            plan.push((format!("{} (CUDA)", strip_index(label)), BackendSpec::Cuda(i)));
+        }
+        !names.is_empty()
+    };
+    #[cfg(not(feature = "cuda"))]
+    let cuda_has_nvidia = false;
+
+    // Remaining OpenCL cards via OpenCL; skip NVIDIA ones already on CUDA.
+    #[cfg(feature = "gpu")]
+    {
+        let names = gpu::list_devices().unwrap_or_default();
+        let nvidia = gpu::device_is_nvidia();
+        for (j, label) in names.iter().enumerate() {
+            if nvidia.get(j).copied().unwrap_or(false) && cuda_has_nvidia {
+                continue;
+            }
+            plan.push((format!("{} (OpenCL)", strip_index(label)), BackendSpec::Gpu(j)));
+        }
+    }
+    // `cuda_has_nvidia` is only consumed by the OpenCL branch above.
+    #[cfg(not(feature = "gpu"))]
+    let _ = cuda_has_nvidia;
+
+    plan
+}
+
+/// Build the worker list for `--backend mixed`: each card on its native backend.
+/// `--devices` selects into [`mixed_plan`]'s unified list.
+#[cfg(any(feature = "gpu", feature = "cuda"))]
+fn mixed_specs(args: &Args) -> Result<Vec<BackendSpec>> {
+    let plan = mixed_plan();
+    if plan.is_empty() {
+        return Err(anyhow!(
+            "no GPUs found for the mixed backend — none detected via CUDA or OpenCL"
+        ));
+    }
+    let selected = parse_devices(&args.devices, plan.len())?;
+    Ok(selected.into_iter().map(|i| plan[i].1).collect())
 }
 
 /// Build a single GPU worker spec for `idx`, choosing CUDA or OpenCL, erroring if
@@ -821,6 +913,18 @@ fn list_devices() {
         Ok(_) => println!("no CUDA devices found"),
         Err(e) => println!("error listing CUDA devices: {e}"),
     }
+    // What the default `mixed` backend will mine, and the indices `--devices`
+    // selects from in that mode.
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
+    {
+        let plan = mixed_plan();
+        if !plan.is_empty() {
+            println!("\nMixed backend (--backend mixed, the default) — `--devices` indexes this list:");
+            for (i, (label, _)) in plan.iter().enumerate() {
+                println!("  [{i}] {label}");
+            }
+        }
+    }
     #[cfg(not(any(feature = "gpu", feature = "cuda")))]
     println!("built without GPU support (rebuild with the `gpu` or `cuda` feature)");
 }
@@ -886,18 +990,24 @@ fn selftest(gpu_device: usize) -> Result<()> {
         let solver = gpu::GpuSolver::new(gpu_device)
             .with_context(|| format!("init OpenCL device {gpu_device}"))?;
 
-        // Spot-check the BLAKE2b kernel against the CPU reference.
-        let outputs = solver.hash_all(&header)?;
-        let step = params::BLAKE_CALLS / 64;
-        for k in 0..64 {
-            let g = (k * step) as u32;
-            let cpu = blake::generate_hash(&base, g);
-            let off = g as usize * params::HASH_OUTPUT;
-            if cpu != outputs[off..off + params::HASH_OUTPUT] {
-                return Err(anyhow!("GPU BLAKE2b mismatch at g={g}"));
+        // Spot-check the BLAKE2b kernel against the CPU reference. The AMD kernel
+        // buckets its round-0 output instead of exposing per-index digests, so
+        // the probe is skipped there (the solve-vs-CPU check below still runs).
+        if solver.supports_blake_probe() {
+            let outputs = solver.hash_all(&header)?;
+            let step = params::BLAKE_CALLS / 64;
+            for k in 0..64 {
+                let g = (k * step) as u32;
+                let cpu = blake::generate_hash(&base, g);
+                let off = g as usize * params::HASH_OUTPUT;
+                if cpu != outputs[off..off + params::HASH_OUTPUT] {
+                    return Err(anyhow!("GPU BLAKE2b mismatch at g={g}"));
+                }
             }
+            info!("GPU BLAKE2b kernel matches CPU");
+        } else {
+            info!("skipping BLAKE2b kernel probe (AMD kernel buckets round-0 output)");
         }
-        info!("GPU BLAKE2b kernel matches CPU");
 
         let gpu_solutions = solver.solve(&header)?;
         info!("GPU found {} valid solution(s)", gpu_solutions.len());

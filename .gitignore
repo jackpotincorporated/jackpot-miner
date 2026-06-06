@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Portable container build output (build-portable.sh)
+/dist
+
 # IDE / editor
 /.idea
 

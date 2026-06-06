@@ -1,0 +1,7 @@
+# Keep the build context small: the portable build only needs the sources.
+/target
+/dist
+/.git
+/pearl-dump
+/alpha-miner
+*.log

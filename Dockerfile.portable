@@ -1,0 +1,40 @@
+# Portable jackpotminer build.
+#
+# Links against Debian bullseye's glibc 2.31 (released 2020), so the resulting
+# binary runs on essentially any Linux from the last several years instead of
+# requiring the build host's (much newer) glibc. This is the real fix for the
+# "version `GLIBC_2.39' not found" class of errors — static linking can't solve
+# it for a GPU build, because the GPU driver libraries are glibc-only and load
+# at runtime.
+#
+# The CUDA driver and NVML are dlopen'd at runtime (see src/dylib.rs), so this
+# build needs NO NVIDIA toolkit — only the OpenCL ICD loader (to link libOpenCL).
+# The result is one binary that drives AMD cards (OpenCL) and NVIDIA cards (CUDA,
+# loaded if libcuda.so.1 is present at runtime).
+#
+# Build:   DOCKER_BUILDKIT=1 docker build -f Dockerfile.portable \
+#            --output type=local,dest=dist .
+# or just: ./build-portable.sh
+# Output:  dist/jackpotminer
+
+FROM debian:bullseye-slim AS build
+ENV DEBIAN_FRONTEND=noninteractive
+# gcc/g++ for the linker; ocl-icd-opencl-dev provides libOpenCL.so for linking
+# (the runtime host supplies its own libOpenCL.so.1 via its GPU driver).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gcc g++ make pkg-config ocl-icd-opencl-dev \
+    && rm -rf /var/lib/apt/lists/*
+# Minimal stable Rust toolchain.
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /src
+COPY . .
+# Miner only (no GUI config tool, to avoid pulling X11/Wayland/GL into the
+# build): AMD OpenCL + dlopen'd CUDA. `--locked` keeps it reproducible.
+RUN cargo build --release --locked --no-default-features --features gpu,cuda \
+    && strip target/release/jackpotminer
+
+# Export just the binary to the build output directory.
+FROM scratch AS export
+COPY --from=build /src/target/release/jackpotminer /jackpotminer

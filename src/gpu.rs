@@ -151,8 +151,9 @@ fn kernel_source(geom: &Geom) -> String {
     )
 }
 
-/// A persistent OpenCL solver bound to one device.
-pub struct GpuSolver {
+/// The default (project-native) OpenCL solver, bound to one device. Wrapped by
+/// [`GpuSolver`], which selects it for non-AMD devices.
+struct LegacySolver {
     pq: ProQue,
     header: Buffer<u8>,
     /// Per-table back-reference arrays (1 u32/slot), kept resident for recovery.
@@ -167,15 +168,14 @@ pub struct GpuSolver {
     nr_rows: usize,
 }
 
-impl GpuSolver {
+impl LegacySolver {
     /// This device's product name (e.g. "NVIDIA GeForce RTX 5080"), if available.
     pub fn device_name(&self) -> Option<String> {
         self.pq.device().name().ok()
     }
 
     /// Initialise the solver and allocate all device buffers.
-    pub fn new(device_index: usize) -> Result<Self> {
-        let (platform, device) = pick_device(device_index)?;
+    pub fn new(platform: ocl::Platform, device: ocl::Device) -> Result<Self> {
         let geom = pick_geom(&device);
         // The device's platform must be set explicitly: ProQue otherwise builds
         // the context against `Platform::default()` (the first platform), which
@@ -406,6 +406,101 @@ impl GpuSolver {
     }
 }
 
+/// OpenCL solver for one device. Dispatches to the AMD-tuned kernel
+/// (`equihash192_7.cl`) on AMD-vendor devices and the default project kernel
+/// (`equihash.cl`) everywhere else. Forceable with `ZCL_OPENCL_KERNEL=amd|legacy`.
+pub struct GpuSolver {
+    inner: SolverInner,
+}
+
+enum SolverInner {
+    Legacy(LegacySolver),
+    Amd(crate::gpu_amd::AmdSolver),
+}
+
+impl GpuSolver {
+    /// Initialise the solver for a flat device index, choosing the kernel by
+    /// device vendor (AMD → `equihash192_7.cl`).
+    pub fn new(device_index: usize) -> Result<Self> {
+        let (platform, device) = pick_device(device_index)?;
+        let inner = if use_amd_kernel(&device) {
+            log::info!("OpenCL: AMD device — using the equihash192_7 kernel");
+            SolverInner::Amd(crate::gpu_amd::AmdSolver::new(platform, device)?)
+        } else {
+            SolverInner::Legacy(LegacySolver::new(platform, device)?)
+        };
+        Ok(Self { inner })
+    }
+
+    /// This device's product name, if available.
+    pub fn device_name(&self) -> Option<String> {
+        match &self.inner {
+            SolverInner::Legacy(s) => s.device_name(),
+            SolverInner::Amd(s) => s.device_name(),
+        }
+    }
+
+    /// Solve the puzzle for `header` (140 bytes).
+    pub fn solve(&self, header: &[u8]) -> Result<Vec<Vec<u32>>> {
+        match &self.inner {
+            SolverInner::Legacy(s) => s.solve(header),
+            SolverInner::Amd(s) => s.solve(header),
+        }
+    }
+
+    /// Solve and also return the raw GPU candidate count (for diagnostics).
+    pub fn solve_with_stats(&self, header: &[u8]) -> Result<(usize, Vec<Vec<u32>>)> {
+        match &self.inner {
+            SolverInner::Legacy(s) => s.solve_with_stats(header),
+            SolverInner::Amd(s) => s.solve_with_stats(header),
+        }
+    }
+
+    /// Time each GPU stage individually.
+    pub fn profile(&self, header: &[u8]) -> Result<()> {
+        match &self.inner {
+            SolverInner::Legacy(s) => s.profile(header),
+            SolverInner::Amd(s) => s.profile(header),
+        }
+    }
+
+    /// Whether the per-index BLAKE2b probe ([`Self::hash_all`]) is available.
+    /// Only the default kernel exposes a linear digest layout; the AMD kernel
+    /// buckets in round 0, so the self-test skips the probe there.
+    pub fn supports_blake_probe(&self) -> bool {
+        matches!(self.inner, SolverInner::Legacy(_))
+    }
+
+    /// Compute every first-round BLAKE2b output (default kernel only).
+    pub fn hash_all(&self, header: &[u8]) -> Result<Vec<u8>> {
+        match &self.inner {
+            SolverInner::Legacy(s) => s.hash_all(header),
+            SolverInner::Amd(_) => {
+                Err(anyhow!("hash_all is not supported by the AMD kernel"))
+            }
+        }
+    }
+}
+
+/// Decide whether to drive `device` with the AMD `equihash192_7.cl` kernel.
+/// `ZCL_OPENCL_KERNEL` forces the choice (`amd` or `legacy`); otherwise it's by
+/// device vendor.
+fn use_amd_kernel(device: &ocl::Device) -> bool {
+    use ocl::enums::{DeviceInfo, DeviceInfoResult};
+    match std::env::var("ZCL_OPENCL_KERNEL").ok().as_deref() {
+        Some(v) if v.eq_ignore_ascii_case("amd") => return true,
+        Some(v) if v.eq_ignore_ascii_case("legacy") => return false,
+        _ => {}
+    }
+    match device.info(DeviceInfo::Vendor) {
+        Ok(DeviceInfoResult::Vendor(v)) => {
+            let v = v.to_ascii_lowercase();
+            v.contains("advanced micro devices") || v.contains("amd")
+        }
+        _ => false,
+    }
+}
+
 /// List `(platform, device)` names so the user can choose `--device`.
 pub fn list_devices() -> Result<Vec<String>> {
     use ocl::{Device, Platform};
@@ -420,6 +515,25 @@ pub fn list_devices() -> Result<Vec<String>> {
         }
     }
     Ok(names)
+}
+
+/// For each OpenCL device — in the same flat order as [`list_devices`] and
+/// `--devices` — whether its vendor is NVIDIA. The mixed backend uses this to
+/// hand NVIDIA cards to CUDA (and mine only the non-NVIDIA OpenCL devices).
+pub fn device_is_nvidia() -> Vec<bool> {
+    use ocl::enums::{DeviceInfo, DeviceInfoResult};
+    use ocl::{Device, Platform};
+    let mut out = Vec::new();
+    for platform in Platform::list() {
+        for device in Device::list_all(platform).unwrap_or_default() {
+            let is_nv = matches!(
+                device.info(DeviceInfo::Vendor),
+                Ok(DeviceInfoResult::Vendor(v)) if v.to_ascii_lowercase().contains("nvidia")
+            );
+            out.push(is_nv);
+        }
+    }
+    out
 }
 
 /// The flat OpenCL device index of the first CPU-type device (e.g. PoCL), if any.

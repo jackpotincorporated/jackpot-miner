@@ -23,13 +23,18 @@ socket2 = "0.5"
 ocl = { version = "0.19", optional = true }
 ratatui = "0.30.0"
 eframe = { version = "0.28", optional = true }
+# Runtime loader for the CUDA driver / NVML (dlopen'd, not link-time, so the
+# binary has no build- or load-time dependency on libcuda / libnvidia-ml).
+libloading = { version = "0.8", optional = true }
 
 [features]
 default = ["gpu", "cuda", "config-gui"]
 gpu = ["dep:ocl"]
 # CUDA backend: drives miniZ's embedded Equihash 192,7 fatbin via the CUDA driver
-# API. build.rs only links libcuda (no nvcc / kernel compilation needed).
-cuda = []
+# API. The driver (libcuda) and NVML are dlopen'd at runtime via libloading, so
+# there is no build-time or load-time dependency on them — the binary builds and
+# starts on hosts without an NVIDIA driver and simply reports no CUDA devices.
+cuda = ["dep:libloading"]
 # Optional native GUI config editor (the `jackpotminer-config` binary). Off by
 # default so the miner never pulls in the GUI toolkit.
 config-gui = ["dep:eframe"]

@@ -108,7 +108,16 @@ const CU_LAUNCH_PARAM_END: usize = 0x00;
 const CU_LAUNCH_PARAM_BUFFER_POINTER: usize = 0x01;
 const CU_LAUNCH_PARAM_BUFFER_SIZE: usize = 0x02;
 
-extern "C" {
+// The CUDA driver API, loaded at runtime via dlopen (see `crate::dylib`) rather
+// than linked at build time: the SONAME `libcuda.so.1` ships with the NVIDIA
+// driver (`nvcuda.dll` on Windows) and is absent on driver-less / AMD-only
+// hosts. `cuda_lib()` returns `None` when it can't be opened; the public entry
+// points below turn that into a clear error / empty device list, so the binary
+// still builds and starts everywhere.
+crate::dylib::dynamic_library! {
+    lib_struct: CudaLib,
+    loader: cuda_lib,
+    names: ["libcuda.so.1", "libcuda.so", "nvcuda.dll"],
     fn cuInit(flags: c_uint) -> CUresult;
     fn cuDeviceGetCount(count: *mut c_int) -> CUresult;
     fn cuDeviceGet(device: *mut CUdevice, ordinal: c_int) -> CUresult;
@@ -148,6 +157,11 @@ extern "C" {
     fn cuGetErrorName(error: CUresult, str: *mut *const c_char) -> CUresult;
 }
 
+/// Error returned when the CUDA driver library isn't present on the host.
+fn cuda_unavailable() -> anyhow::Error {
+    anyhow!("CUDA driver library (libcuda.so.1) not found — is the NVIDIA driver installed?")
+}
+
 /// Turn a non-success `CUresult` into an error with the driver's symbolic name.
 fn check(code: CUresult, what: &str) -> Result<()> {
     if code == CUDA_SUCCESS {
@@ -164,8 +178,10 @@ fn check(code: CUresult, what: &str) -> Result<()> {
     Err(anyhow!("{what} failed: {name}"))
 }
 
-/// Number of CUDA devices (initialises the driver as a side effect).
+/// Number of CUDA devices (initialises the driver as a side effect). Returns an
+/// error if the CUDA driver library isn't installed.
 pub fn device_count() -> Result<usize> {
+    cuda_lib().ok_or_else(cuda_unavailable)?;
     unsafe {
         check(cuInit(0), "cuInit")?;
         let mut n: c_int = 0;
@@ -579,6 +595,7 @@ impl CudaSolver {
     /// fatbin, select the config that fits free VRAM, allocate its buffers, and
     /// rebase the recorded launch sequence.
     pub fn new(device_index: usize) -> Result<Self> {
+        cuda_lib().ok_or_else(cuda_unavailable)?;
         unsafe {
             check(cuInit(0), "cuInit")?;
             let mut dev: CUdevice = 0;

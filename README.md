@@ -98,16 +98,45 @@ reverse-engineered Equihash 192,7 solver — see "CUDA backend" below.
 
 ## Build
 
-Requirements: a Rust toolchain and an OpenCL runtime (the NVIDIA driver ships
-`libOpenCL`). The CUDA backend only needs `libcuda` (the NVIDIA driver) — the
-fatbin and launch trace it drives are embedded in the binary, so no CUDA toolkit
-or `nvcc` is required.
+Requirements: a Rust toolchain and, for the OpenCL backend, the OpenCL ICD
+loader (`libOpenCL` — e.g. `ocl-icd-opencl-dev` on Debian/Ubuntu; the NVIDIA and
+AMD drivers also ship it). The CUDA driver and NVML are **`dlopen`'d at runtime**
+(see `src/dylib.rs`), so the `cuda` feature needs no NVIDIA toolkit or libs to
+build, and a `cuda`-enabled binary still builds and starts on hosts without an
+NVIDIA driver — it simply reports no CUDA devices. The fatbin and launch trace
+the CUDA backend drives are embedded, so no `nvcc` is required either.
 
 ```bash
-cargo build --release                          # OpenCL backend (default)
-cargo build --release --features cuda           # OpenCL + CUDA backends
-cargo build --release --no-default-features --features cuda   # CUDA only
-cargo build --release --no-default-features      # CPU-only (no GPU)
+cargo build --release                          # default: OpenCL + CUDA + GUI config tool
+cargo build --release --no-default-features --features gpu,cuda  # miner only, both GPU backends
+cargo build --release --no-default-features --features gpu        # OpenCL only (AMD/Intel/NVIDIA)
+cargo build --release --no-default-features --features cuda       # CUDA only
+cargo build --release --no-default-features                       # CPU-only (no GPU)
+```
+
+### Portable / distributable builds
+
+The miner's only runtime dependencies are the C library and the OpenCL ICD loader
+(`libOpenCL.so.1`, present wherever a GPU driver is); CUDA/NVML are loaded on
+demand. So the main compatibility risk when shipping a Linux binary is the
+**glibc version** it was built against — not the GPU libraries. To build one that
+runs on older distros, compile against an old glibc in a container:
+
+```bash
+./build-portable.sh          # → dist/jackpotminer   (Docker, or ENGINE=podman)
+```
+
+This links against Debian bullseye's glibc 2.31 (runs on most Linux from ~2020
+on) and yields a single miner that drives both AMD (OpenCL) and NVIDIA (CUDA)
+cards. See `Dockerfile.portable`.
+
+A fully *static* GPU binary isn't possible: the OpenCL/CUDA driver libraries are
+glibc-only and must load at runtime. For a zero-dependency binary that runs
+anywhere, build the **CPU-only** miner against musl:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl --no-default-features
 ```
 
 ### CUDA backend (miniZ fatbin replay)
@@ -181,7 +210,7 @@ on clean shutdown**. The per-card stats line shows live `Sol/s`, board `W`, and
 ## Usage
 
 ```bash
-# List OpenCL devices
+# List devices (and the default "mixed" backend's combined index list)
 ./target/release/jackpotminer --list-devices
 
 # Mine on one GPU
@@ -195,8 +224,11 @@ on clean shutdown**. The per-card stats line shows live `Sol/s`, board `W`, and
 ./target/release/jackpotminer --url ... --user ... --devices 0,1
 ./target/release/jackpotminer --url ... --user ... --devices all
 
-# Use the CUDA backend instead of OpenCL (needs a --features cuda build)
-./target/release/jackpotminer --url ... --user ... --backend cuda --devices all
+# Default backend is "mixed": NVIDIA cards run on CUDA, AMD/Intel on OpenCL —
+# so an AMD + NVIDIA rig just works. --devices indexes the combined list from
+# --list-devices. Pin a single backend for every card with:
+./target/release/jackpotminer --url ... --user ... --backend opencl   # all via OpenCL
+./target/release/jackpotminer --url ... --user ... --backend cuda     # NVIDIA only
 
 # Force the CPU backend
 ./target/release/jackpotminer --url ... --user ... --cpu
