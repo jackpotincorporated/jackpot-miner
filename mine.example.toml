@@ -12,7 +12,8 @@
 #   jackpotminer --config mine.toml
 
 # ── Pool (required) ───────────────────────────────────────────────────────────
-url  = "stratum+tcp://zcl.pool.example:3032"   # stratum+tcp://host:port, or host:port
+url  = "stratum+tcp://zcl.jackpot.tools:3333"  # stratum+tcp://host:port, or host:port
+                                               # (this is also the built-in default if unset)
 user = "t1YourZClassicAddressHere.rig1"        # payout address / worker login
 # port = 3032                                  # only if `url` has no ":port"
 

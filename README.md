@@ -240,8 +240,9 @@ on clean shutdown**. The per-card stats line shows live `Sol/s`, board `W`, and
 ./target/release/jackpotminer --selftest
 ```
 
-Key flags: `--url`, `--port` (fallback when the URL omits one), `--user` (`-u`),
-`--pass` (`-p`), `--backend` (`opencl`/`cuda`), `--devices` (e.g. `0,1` or `all`),
+Key flags: `--url` (defaults to `stratum+tcp://zcl.jackpot.tools:3333` when
+unset), `--port` (fallback when the URL omits one), `--user` (`-u`),
+`--pass` (`-p`), `--backend` (`mixed`/`opencl`/`cuda`), `--devices` (e.g. `0,1` or `all`),
 `--device` (`-d`, for single-device benchmark/debug), `--threads` (`-t`), `--cpu`,
 `--benchmark N`, `--list-devices`, `--selftest`. When mining in a terminal a live
 ratatui **dashboard** is shown by default (per-card Sol/s, power, temperature,

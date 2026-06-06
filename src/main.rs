@@ -42,6 +42,9 @@ use log::{info, warn};
 use crate::miner::BackendSpec;
 use crate::stratum::StratumClient;
 
+/// Pool used when neither `--url` nor a config file specifies one.
+const DEFAULT_POOL_URL: &str = "stratum+tcp://zcl.jackpot.tools:3333";
+
 /// Command-line options.
 #[derive(Parser, Debug)]
 #[command(name = "jackpotminer", version, about = "equihash 192,7 miner")]
@@ -53,7 +56,8 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     config: Option<String>,
 
-    /// Pool URL, e.g. stratum+tcp://zcl.pool.example:3032
+    /// Pool URL, e.g. stratum+tcp://zcl.pool.example:3032. Defaults to
+    /// stratum+tcp://zcl.jackpot.tools:3333 when unset (here and in the config).
     #[arg(long)]
     url: Option<String>,
 
@@ -545,10 +549,9 @@ fn main() -> Result<()> {
         return benchmark(specs, runs.max(1));
     }
 
-    let url = args
-        .url
-        .as_deref()
-        .ok_or_else(|| anyhow!("--url is required (e.g. stratum+tcp://host:port)"))?;
+    // Pool URL defaults to the jackpot.tools ZCL pool when not given on the CLI
+    // or in a config file.
+    let url = args.url.as_deref().unwrap_or(DEFAULT_POOL_URL);
     let (host, port) = parse_url(url, args.port)?;
 
     // Password = pool mode. --solo / --jackpot <pct> take precedence; otherwise
