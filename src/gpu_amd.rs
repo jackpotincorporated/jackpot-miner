@@ -106,8 +106,20 @@ impl AmdSolver {
     /// Build the solver on `(platform, device)` and allocate all device buffers
     /// (~3.5 GB total).
     pub fn new(platform: ocl::Platform, device: ocl::Device) -> Result<Self> {
+        // Build the program via an explicit ProgramBuilder so OpenCL compiler
+        // options can be injected. `ZCL_CL_OPTS` (space-separated) is appended to
+        // the build — e.g. `-mwavefrontsize64` to force wave64 on RDNA, or other
+        // flags — for RDNA4 tuning experiments without recompiling the host.
+        let mut prog = ocl::Program::builder();
+        prog.src(KERNEL_SRC);
+        if let Ok(opts) = std::env::var("ZCL_CL_OPTS") {
+            for opt in opts.split_whitespace() {
+                prog.cmplr_opt(opt.to_string());
+            }
+            log::info!("AMD OpenCL: extra build options: {opts}");
+        }
         let pq = ProQue::builder()
-            .src(KERNEL_SRC)
+            .prog_bldr(prog)
             .platform(platform)
             .device(device)
             .dims(1) // placeholder; every launch sets its own work size
