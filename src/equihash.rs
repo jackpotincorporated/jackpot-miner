@@ -131,23 +131,31 @@ fn leaf_row(base: &State, idx: u32) -> Row {
 // histogram that has to be zeroed, scatter-filled, and cloned every round). Two
 // entries can collide only when their *whole* leading block matches, so they
 // always land in the same partition — making the partitions independent
-// collision domains that are processed in parallel across the rayon pool the
-// single CPU worker otherwise leaves idle.
+// collision domains processed in parallel across the rayon pool.
 //
-// The data layout follows xenoncat's packed slots and targets AVX2 throughput:
-//   * Entries live in fixed 32-byte `SLOT`s (one `__m256i`); producing a child
-//     is a single load/xor/permute/store (`xor_child_avx2`).
-//   * A dense parallel `keys[]` array mirrors each entry's leading block, so the
-//     `partition_top`/`count_pairs`/`low_group` histogram sweeps stream over
-//     4 bytes/entry instead of striding the slots.
+// The data layout targets AVX2 throughput; the round is memory-bandwidth bound,
+// so every choice below exists to cut DRAM traffic / random access:
+//   * `partition_top` is a parallel counting sort (per-chunk histograms ->
+//     per-chunk base offsets -> disjoint-region scatter), not a serial pass.
+//   * It also emits `keys_part` (the leading keys in partition order) so the
+//     per-partition `count_pairs`/`low_group` sweeps read keys sequentially
+//     instead of gathering `keys[order[..]]`; `low_group` likewise emits
+//     `keys_sorted` so the emit group walk streams a dense local copy.
+//   * Slots hold residual hash words in a *narrowing* packed slot: round 0 is
+//     `SLOT` words; each round consumes the leading block, so round r packs at
+//     `SLOT - r` words. The XOR child is one 256-bit load/xor/permute that
+//     masked-stores the live lanes (`xor_child_avx2`); buffers carry a
+//     `SLOT_SLACK` pad for the 256-bit over-read of a narrow tail slot.
 //   * `collide` runs two passes — count pairs, then emit children directly into
 //     one pre-sized arena at per-partition offsets — so there is no per-bucket
 //     allocation and no final concatenation copy; the `keys`/`slots` buffers
 //     ping-pong between rounds.
 //   * Round 0 repacks BLAKE2b digests into 24-bit blocks with `pshufb`.
-// A further bandwidth step (not yet taken) is xenoncat's full radix scatter of
-// the payload into bucket-contiguous storage, turning the inner-loop slot
-// gathers into sequential reads.
+// The remaining bottleneck is the random slot gather in `emit_bucket` over the
+// ~1 GiB round buffer — the Equihash memory-hardness floor. A full radix scatter
+// of the payload into bucket-contiguous storage (to make that gather sequential)
+// was evaluated and loses: the wide-slot scatter costs more than the gather it
+// saves on the early, wide rounds.
 // ---------------------------------------------------------------------------
 
 /// 24-bit collision blocks carried by a round-0 entry (= 8 for 192,7).
