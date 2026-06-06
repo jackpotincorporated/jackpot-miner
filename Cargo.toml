@@ -23,12 +23,6 @@ socket2 = "0.5"
 ocl = { version = "0.19", optional = true }
 ratatui = "0.30.0"
 eframe = { version = "0.28", optional = true }
-# Pearl (PRL) pearlhash backend deps (feature `pearl`).
-blake3 = { version = "1.5", optional = true }
-primitive-types = { version = "0.12", optional = true }
-rand = { version = "0.9", optional = true }
-bincode = { version = "1", optional = true }
-base64 = { version = "0.22", optional = true }
 
 [features]
 default = ["gpu", "cuda", "config-gui"]
@@ -36,16 +30,6 @@ gpu = ["dep:ocl"]
 # CUDA backend: drives miniZ's embedded Equihash 192,7 fatbin via the CUDA driver
 # API. build.rs only links libcuda (no nvcc / kernel compilation needed).
 cuda = []
-# Ethash backend (miniZ's extracted Ethash solver), default-off / work-in-progress:
-# blobs + replay scaffold live in src/ethash/; needs a captured launch recording to
-# go live (see src/ethash/README.md). Pulls in the same libcuda link as `cuda`.
-ethash = ["cuda"]
-# Pearl (PRL) pearlhash backend (default-off): native CPU miner+verifier ported
-# from the open-source reference. See src/pearl/ and pearl-dump/SPEC.md.
-pearl = ["dep:blake3", "dep:primitive-types", "dep:rand", "dep:bincode", "dep:base64"]
-# Pearl GPU acceleration: NVRTC-compiled int8 GEMM+transcript kernel (links
-# libcuda + libnvrtc; no build-time nvcc). Validated against the CPU reference.
-pearl-cuda = ["pearl"]
 # Optional native GUI config editor (the `jackpotminer-config` binary). Off by
 # default so the miner never pulls in the GUI toolkit.
 config-gui = ["dep:eframe"]

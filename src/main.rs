@@ -17,14 +17,6 @@ mod gpu;
 #[cfg(feature = "cuda")]
 mod cuda;
 
-// Ethash backend (default-off, work-in-progress; see src/ethash/README.md).
-#[cfg(feature = "ethash")]
-mod ethash;
-
-// Pearl (PRL) pearlhash backend (default-off; native port of the open reference).
-#[cfg(feature = "pearl")]
-mod pearl;
-
 #[cfg(feature = "cuda")]
 mod nvml;
 
@@ -150,11 +142,6 @@ struct Args {
     /// GPU backend: "opencl" or "cuda" (for nvidia cards).
     #[arg(long, default_value = "cuda")]
     backend: String,
-
-    /// Mining algorithm: "equihash" (default) or "pearl" (PRL pearlhash; needs
-    /// the `pearl` feature). Pearl is a distinct PoW with its own pool protocol.
-    #[arg(long, default_value = "equihash")]
-    algo: String,
 
     /// Force the OpenCL backend, disabling CUDA (overrides --backend).
     #[arg(long)]
@@ -564,35 +551,6 @@ fn main() -> Result<()> {
     } else {
         "jackpot".to_string()
     };
-    // Pearl (PRL) pearlhash is a distinct algorithm + pool protocol; branch to
-    // its own loop before the Equihash stratum client.
-    #[cfg(feature = "pearl")]
-    if args.algo.eq_ignore_ascii_case("pearl") {
-        let running = Arc::new(AtomicBool::new(true));
-        {
-            let r = running.clone();
-            ctrlc::set_handler(move || r.store(false, Ordering::Relaxed)).ok();
-        }
-        // Pearl pools authorize with a fixed password "x" (see the live capture);
-        // the Equihash jackpot/solo password modes don't apply. Honor an explicit
-        // non-default `-p`, else use "x".
-        let pearl_pass = if args.pass == "jackpot" { "x" } else { args.pass.as_str() };
-        return pearl::stratum::run(&host, port, &args.user, pearl_pass, running);
-    }
-
-    // Ethash/etchash is DAG + search with its own stratum dialect; branch to its
-    // loop. The GPU search drives miniZ's extracted solver via a captured trace
-    // (see src/ethash/README.md); every share is CPU-verified before submit.
-    #[cfg(feature = "ethash")]
-    if args.algo.eq_ignore_ascii_case("ethash") || args.algo.eq_ignore_ascii_case("etchash") {
-        let running = Arc::new(AtomicBool::new(true));
-        {
-            let r = running.clone();
-            ctrlc::set_handler(move || r.store(false, Ordering::Relaxed)).ok();
-        }
-        return ethash::stratum::run(&host, port, &args.user, &pass, args.device, "", running);
-    }
-
     info!("connecting to {host}:{port} as '{}'", args.user);
     let client = Arc::new(StratumClient::connect(&host, port, &args.user, &pass)?);
 

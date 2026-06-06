@@ -21,21 +21,6 @@ fn main() {
         let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
         link_cuda_driver(&target_os);
     }
-
-    // Pearl GPU backend: link the CUDA driver + NVRTC (runtime kernel compiler).
-    // No build-time nvcc — the kernel is compiled at runtime via NVRTC.
-    if std::env::var("CARGO_FEATURE_PEARL_CUDA").is_ok() && std::env::var("CARGO_FEATURE_CUDA").is_err() {
-        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-        link_cuda_driver(&target_os);
-    }
-    if std::env::var("CARGO_FEATURE_PEARL_CUDA").is_ok() {
-        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-        if target_os == "windows" {
-            println!("cargo:rustc-link-lib=dylib=nvrtc");
-        } else {
-            println!("cargo:rustc-link-lib=dylib=nvrtc");
-        }
-    }
 }
 
 /// Link the CUDA driver library plus NVML. The backend loads the embedded miniZ

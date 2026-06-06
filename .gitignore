@@ -11,9 +11,7 @@
 /mine.toml
 
 # Reverse-engineering scratch & competitor binaries — kept local, not committed.
-# Not part of the miner; pearl-dump also holds a 108 MB file over GitHub's limit.
 /alpha-miner
-/pearl-dump/
 
 # OS cruft
 .DS_Store
