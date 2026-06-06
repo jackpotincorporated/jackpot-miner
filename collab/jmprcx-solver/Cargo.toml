@@ -1,0 +1,12 @@
+[package]
+name = "jmprcx-solver"
+version = "0.1.0"
+edition = "2026"
+description = "Load and drive the Equihash 192,7 GPU solver fatbin via the CUDA Driver API"
+
+[[bin]]
+name = "jmprcx-solver"
+path = "src/main.rs"
+
+[dependencies]
+# none on purpose: raw FFI to the system CUDA driver (libcuda), no network needed

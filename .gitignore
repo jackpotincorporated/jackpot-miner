@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target
+
+# IDE / editor
+/.idea
+
+# Claude Code — keep shared settings.json, ignore machine-local overrides
+/.claude/settings.local.json
+
+# Active runtime config (copy mine.example.toml to create it; may hold a wallet)
+/mine.toml
+
+# Reverse-engineering scratch & competitor binaries — kept local, not committed.
+# Not part of the miner; pearl-dump also holds a 108 MB file over GitHub's limit.
+/alpha-miner
+/pearl-dump/
+
+# OS cruft
+.DS_Store

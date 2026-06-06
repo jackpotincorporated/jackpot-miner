@@ -1,0 +1,12 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=jackpotminer
+GenericName=Equihash 192,7 miner
+Comment=Mine ZClassic (Equihash 192,7) — opens in a terminal window
+Exec=/home/access/code/jackpotminer/run-jackpotminer.sh
+Path=/home/access/code/jackpotminer
+Icon=utilities-terminal
+Terminal=true
+Categories=Utility;

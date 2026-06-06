@@ -1,0 +1,52 @@
+# Example jackpotminer configuration file.
+#
+# Load it with:   jackpotminer --config mine.toml
+#
+# Any value set here is used unless the same option is also passed on the command
+# line (the CLI always wins over the file, and the file wins over the built-in
+# defaults). Keys are the long flag names without the leading "--". Unknown keys
+# are rejected, so a typo is reported rather than silently ignored.
+#
+# Copy this file, edit the pool + wallet, uncomment what you need:
+#   cp mine.example.toml mine.toml && $EDITOR mine.toml
+#   jackpotminer --config mine.toml
+
+# ── Pool (required) ───────────────────────────────────────────────────────────
+url  = "stratum+tcp://zcl.pool.example:3032"   # stratum+tcp://host:port, or host:port
+user = "t1YourZClassicAddressHere.rig1"        # payout address / worker login
+# port = 3032                                  # only if `url` has no ":port"
+
+# ── Payout mode (set at most one) ─────────────────────────────────────────────
+# pass       = "jackpot"     # default; also accepts "no-jackpot" / "solo" literally
+# solo       = true
+# jackpot    = 50            # participation percent 3-100  ->  "jackpot.50"
+# no-jackpot = true          # PPLNS
+
+# ── GPU backend ───────────────────────────────────────────────────────────────
+# backend      = "cuda"      # "cuda" or "opencl"
+# devices      = "all"       # "all", or a comma list e.g. "0,1"
+# force-opencl = false       # force OpenCL, disabling CUDA
+
+# ── GPU tuning (clock/power changes need root) ────────────────────────────────
+# no-gpu-tune      = false
+# auto-tune        = false
+# power-limit      = 250     # watts
+# gpu-clock        = 2700    # MHz (lock SM/core clock)
+# mem-clock        = 10000   # MHz (lock memory clock)
+# gpu-clock-offset = 150     # MHz, signed V/F offset
+# mem-clock-offset = 0       # MHz, signed V/F offset
+# unlock-controls  = false   # allow the dashboard's live clock/power keys
+
+# ── CPU mining (runs alongside the GPU) ───────────────────────────────────────
+# cpu            = false     # use the CPU as the primary solver (no GPU)
+# cpu-mining     = false     # start the CPU core rows enabled at launch
+# cpu-cores      = "0-7"     # which logical cores (default: all)
+# cpu-group-size = 4         # cores per CPU mining row (1 = one solve per core)
+# cpu-clamp      = 32        # collision-bucket clamp (0 = exact solver, can OOM)
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+# threads      = 24          # solver CPU threads (default: all cores)
+# job-timeout  = 300         # seconds; pause on stale work (0 disables)
+# no-tui       = false       # disable the dashboard, print log lines instead
+# control-port = 4068        # open 127.0.0.1:<port> so the GUI config tool can
+                             # retrieve/adjust this miner live (off by default)

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi)",
+      "Bash(nvidia-smi --query-gpu *)",
+      "Bash(nm *)",
+      "Bash(readelf *)",
+      "Bash(clinfo)",
+      "Bash(clinfo *)",
+      "Bash(cuobjdump *)",
+      "Bash(nvdisasm *)",
+      "Bash(xxd *)",
+      "Bash(c++filt *)",
+      "Bash(size *)"
+    ]
+  }
+}
