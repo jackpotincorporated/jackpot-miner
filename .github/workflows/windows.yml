@@ -1,0 +1,54 @@
+name: windows
+
+# Build the Windows binaries natively. This proves the build needs no external
+# GPU SDK: the CUDA driver / NVML are dlopen'd at runtime, and build.rs generates
+# the OpenCL import library from windows/OpenCL.def (so the `#[link(name =
+# "OpenCL")]` resolves via lib.exe — present on the MSVC runner). Statically
+# links the CRT so the artifacts need no VC++ redistributable.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      # No VC++ redistributable needed at runtime.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Full build: miner + GUI config tool, OpenCL + dlopen'd CUDA. This is the
+      # link step that exercises the generated OpenCL import library.
+      - name: Build (default features)
+        run: cargo build --release --locked
+
+      # Miner-only build (no GUI), both GPU backends — the lean distributable.
+      - name: Build miner-only (gpu,cuda)
+        run: cargo build --release --locked --no-default-features --features gpu,cuda
+
+      - name: Unit tests
+        run: cargo test --locked --no-default-features --features gpu,cuda
+
+      - name: Show binary info
+        run: |
+          Get-ChildItem target\release\*.exe | ForEach-Object { "{0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB) }
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: jackpotminer-windows-x64
+          path: |
+            target/release/jackpotminer.exe
+            target/release/jackpotminer-config.exe
+          if-no-files-found: error

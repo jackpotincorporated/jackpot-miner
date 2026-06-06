@@ -78,23 +78,11 @@ A `cuda`-enabled binary still starts on a machine with no NVIDIA driver.
 
 ### GitHub Actions (recommended)
 
-```yaml
-name: windows
-on: [push, workflow_dispatch]
-jobs:
-  build:
-    runs-on: windows-latest          # MSVC + lib.exe already on PATH
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --features gpu,cuda
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
-      - uses: actions/upload-artifact@v4
-        with:
-          name: jackpotminer-windows
-          path: target/release/*.exe
-```
+The repo ships [`.github/workflows/windows.yml`](.github/workflows/windows.yml),
+which builds on `windows-latest` (MSVC + `lib.exe` already on `PATH`), runs the
+tests, statically links the CRT, and uploads the `.exe`s as artifacts — so you
+get Windows binaries with no Windows machine. It runs on pushes to `master`, on
+PRs, and via **Run workflow** (manual dispatch).
 
 ### Cross-compile from Linux (GNU target)
 
