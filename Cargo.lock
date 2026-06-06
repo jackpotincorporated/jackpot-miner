@@ -2230,6 +2230,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake2b_simd",
+ "cc",
  "clap",
  "core_affinity",
  "ctrlc",

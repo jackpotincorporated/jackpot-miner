@@ -114,6 +114,13 @@ cargo build --release --no-default-features --features cuda       # CUDA only
 cargo build --release --no-default-features                       # CPU-only (no GPU)
 ```
 
+### Windows
+
+Builds with no external GPU SDKs — CUDA/NVML are loaded at runtime and the
+OpenCL import library is generated at build time. See
+[BUILD-windows.md](BUILD-windows.md) for the toolchain, build, and packaging
+steps.
+
 ### Portable / distributable builds
 
 The miner's only runtime dependencies are the C library and the OpenCL ICD loader

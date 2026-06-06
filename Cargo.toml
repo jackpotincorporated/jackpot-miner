@@ -45,6 +45,11 @@ name = "jackpotminer-config"
 path = "src/config_gui.rs"
 required-features = ["config-gui"]
 
+[build-dependencies]
+# Locates the MSVC `lib.exe` (to generate the OpenCL import library on Windows);
+# unused on other platforms. See build.rs.
+cc = "1"
+
 [profile.release]
 opt-level = 3
 lto = true
