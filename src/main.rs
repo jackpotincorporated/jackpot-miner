@@ -753,7 +753,24 @@ fn backend_specs(args: &Args, gpu_devices: &[GpuDeviceCfg]) -> Result<Vec<Backen
                 }
                 None => default_cuda,
             };
-            specs.push(gpu_spec(idx, cuda)?);
+            // `idx` indexes the *default* backend's device list. A per-card
+            // override that moves the card to the other backend must re-resolve
+            // it to that backend's index by matching the physical card's PCI bus
+            // — the two enumerations differ (OpenCL sees every card, CUDA only
+            // NVIDIA), so reusing the raw index would target the wrong GPU.
+            let target_idx = if cuda == default_cuda {
+                idx
+            } else {
+                #[cfg(all(feature = "gpu", feature = "cuda"))]
+                {
+                    translate_device_index(idx, default_cuda, cuda)?
+                }
+                #[cfg(not(all(feature = "gpu", feature = "cuda")))]
+                {
+                    idx // single-backend build: gpu_spec errors on the missing backend
+                }
+            };
+            specs.push(gpu_spec(target_idx, cuda)?);
         }
         Ok(specs)
     }
@@ -853,6 +870,32 @@ fn gpu_spec(idx: usize, cuda: bool) -> Result<BackendSpec> {
             Err(anyhow!("device {idx} requests the OpenCL backend, but it isn't compiled in (build with --features gpu)"))
         }
     }
+}
+
+/// Re-resolve a device index from the `from_cuda` backend's enumeration to the
+/// `to_cuda` backend's, by matching the physical card's PCI bus number. Used when
+/// a `[[gpu]]` table moves a card to the other backend. Errors clearly if the
+/// bus can't be read or no card in the target backend matches.
+#[cfg(all(feature = "gpu", feature = "cuda"))]
+fn translate_device_index(idx: usize, from_cuda: bool, to_cuda: bool) -> Result<usize> {
+    let buses = |is_cuda: bool| -> Vec<Option<u32>> {
+        if is_cuda {
+            cuda::device_pci_buses()
+        } else {
+            gpu::device_pci_buses()
+        }
+    };
+    let to_name = if to_cuda { "CUDA" } else { "OpenCL" };
+    let src_bus = buses(from_cuda).get(idx).and_then(|b| *b).ok_or_else(|| {
+        anyhow!(
+            "device {idx}: can't read its PCI bus to move it to the {to_name} backend; \
+             list it under its native backend instead"
+        )
+    })?;
+    buses(to_cuda)
+        .iter()
+        .position(|b| *b == Some(src_bus))
+        .ok_or_else(|| anyhow!("device {idx} (PCI bus {src_bus:#04x}) has no match in the {to_name} device list"))
 }
 
 /// Parse a `--devices` value: "all" (use `available`) or a comma-separated list.

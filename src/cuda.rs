@@ -213,6 +213,37 @@ pub fn list_devices() -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// The PCI bus number of each CUDA device (index-aligned with [`list_devices`]),
+/// `None` where it can't be read. Used to match a card to its OpenCL twin when a
+/// `[[gpu]]` table moves it between backends. The driver reports the bus id as
+/// `"<domain>:<bus>:<device>.<function>"` (e.g. `"0000:01:00.0"`). Only built
+/// alongside OpenCL (its sole caller is the cross-backend index translation).
+#[cfg(feature = "gpu")]
+pub fn device_pci_buses() -> Vec<Option<u32>> {
+    let Some(n) = device_count().ok() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(n);
+    unsafe {
+        for i in 0..n {
+            let mut dev: CUdevice = 0;
+            let bus = if cuDeviceGet(&mut dev, i as c_int) == CUDA_SUCCESS {
+                let mut buf = [0i8; 32];
+                if cuDeviceGetPCIBusId(buf.as_mut_ptr() as *mut c_char, 32, dev) == CUDA_SUCCESS {
+                    let s = CStr::from_ptr(buf.as_ptr() as *const c_char).to_string_lossy();
+                    s.split(':').nth(1).and_then(|b| u32::from_str_radix(b.trim(), 16).ok())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            out.push(bus);
+        }
+    }
+    out
+}
+
 // ---- BLAKE2b midstate (Equihash 192,7 personalisation) ----
 //
 // digit_f wants the 64-byte BLAKE2b state after compressing the first 128-byte

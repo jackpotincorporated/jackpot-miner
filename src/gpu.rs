@@ -536,6 +536,46 @@ pub fn device_is_nvidia() -> Vec<bool> {
     out
 }
 
+/// The PCI bus number of each OpenCL device (same flat order as [`list_devices`]
+/// / `--devices`), `None` where it can't be read. Queried via the
+/// `cl_khr_pci_bus_info` device info, falling back to the NVIDIA bus-id
+/// extension. Lets a `[[gpu]]` per-card backend override match a card to its
+/// CUDA twin across the two device enumerations. Only built alongside CUDA (its
+/// sole caller is the cross-backend index translation).
+#[cfg(feature = "cuda")]
+pub fn device_pci_buses() -> Vec<Option<u32>> {
+    use ocl::{Device, Platform};
+    // cl_khr_pci_bus_info: { pci_domain, pci_bus, pci_device, pci_function } (4×u32).
+    const CL_DEVICE_PCI_BUS_INFO_KHR: u32 = 0x410F;
+    // AMD (cl_amd_device_attribute_query): cl_device_topology_amd, a 24-byte
+    // union; for PCIe (type byte == 1) the bus is at byte 21.
+    const CL_DEVICE_TOPOLOGY_AMD: u32 = 0x4037;
+    // NVIDIA (cl_nv_device_attribute_query): a single cl_uint bus number.
+    const CL_DEVICE_PCI_BUS_ID_NV: u32 = 0x4008;
+    let info = |d: &ocl::core::DeviceId, req: u32| ocl::core::get_device_info_raw(d, req).ok();
+    let mut out = Vec::new();
+    for platform in Platform::list() {
+        for device in Device::list_all(platform).unwrap_or_default() {
+            let core = device.as_core();
+            let bus = info(core, CL_DEVICE_PCI_BUS_INFO_KHR)
+                .filter(|b| b.len() >= 8)
+                .map(|b| u32::from_ne_bytes([b[4], b[5], b[6], b[7]])) // 2nd u32 = pci_bus
+                .or_else(|| {
+                    info(core, CL_DEVICE_TOPOLOGY_AMD)
+                        .filter(|b| b.len() >= 24 && b[0] == 1)
+                        .map(|b| b[21] as u32)
+                })
+                .or_else(|| {
+                    info(core, CL_DEVICE_PCI_BUS_ID_NV)
+                        .filter(|b| b.len() >= 4)
+                        .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+                });
+            out.push(bus);
+        }
+    }
+    out
+}
+
 /// The flat OpenCL device index of the first CPU-type device (e.g. PoCL), if any.
 /// Lets CPU mining run through the OpenCL backend on the CPU. The index matches
 /// [`list_devices`] / `--devices`.
