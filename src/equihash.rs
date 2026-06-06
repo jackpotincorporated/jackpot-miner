@@ -164,36 +164,53 @@ const LOW_BUCKETS: usize = 1 << LOW_BITS;
 /// Mask isolating the low resolved bits.
 const LOW_MASK: u32 = (LOW_BUCKETS - 1) as u32;
 
-/// Number of u32 words in a padded entry slot (32 bytes = one AVX2 register).
-/// Every round stores its residual hash words in a fixed 8-word slot so the XOR
-/// that produces a child is a single 256-bit load/xor/permute/store and every
-/// slot access is naturally aligned — xenoncat's packed-slot trick (and the same
-/// `uint4`-aligned-slot idea the CUDA backend already uses), on the CPU. The
-/// leading collision word lives in lane 0 and is mirrored into a dense parallel
-/// `keys[]` array so the histogram passes stream over 4 bytes/entry instead of
-/// striding the 32-byte slots.
+/// Number of u32 words in a round-0 entry slot (32 bytes = one AVX2 register).
+/// Round 0 stores all eight 24-bit blocks; the XOR that produces a child is a
+/// single 256-bit load/xor/permute — xenoncat's packed-slot trick (and the same
+/// `uint4`-aligned-slot idea the CUDA backend uses), on the CPU. The leading
+/// collision word lives in lane 0 and is mirrored into a dense parallel `keys[]`
+/// array so the histogram passes stream over 4 bytes/entry instead of striding
+/// the slots.
+///
+/// Later rounds use a *narrower* pitch: each collision round consumes the leading
+/// block, so a round-`r` output entry only carries `8 - r` meaningful words. The
+/// solver packs each round's slots at that width (see `collide`'s `w_out`),
+/// cutting the per-round slot-buffer DRAM traffic that bounds the collision rounds.
+/// The XOR producer still loads a full 256-bit register (over-reading up to
+/// `SLOT` words past a narrow tail slot, hence the `SLOT_SLACK` pad) but
+/// masked-stores only the `w_out` live lanes so packed neighbours aren't touched.
 const SLOT: usize = 8;
 
-/// Scalar child producer: `out[0..8] = (a XOR b)` rotated left one lane; returns
-/// the child's new leading word (lane 1 of the XOR). Lane 0 of the XOR is the
-/// just-collided block (always zero) and is rotated out.
+/// Trailing pad (in u32 words) on every slot buffer so the XOR producer's 256-bit
+/// load over a narrow tail slot stays in bounds. The over-read reaches at most
+/// `(n-1)*w + SLOT` words for pitch `w`, i.e. `SLOT - w ≤ SLOT` words past the
+/// `n*w` payload; `SLOT` words always covers it.
+const SLOT_SLACK: usize = SLOT;
+
+/// Scalar child producer: writes the `w_out` live words of `(a XOR b)` rotated
+/// left one lane into `out`, and returns the child's new leading word (lane 1 of
+/// the XOR). Lane 0 of the XOR is the just-collided block (always zero) and is
+/// rotated out. `a`/`b` are read a full `SLOT` words wide (the caller pads each
+/// slot buffer by `SLOT_SLACK`); only `out[0..w_out]` is written.
 #[inline]
-unsafe fn xor_child_scalar(out: *mut u32, a: *const u32, b: *const u32) -> u32 {
+unsafe fn xor_child_scalar(out: *mut u32, a: *const u32, b: *const u32, w_out: usize) -> u32 {
     let mut x = [0u32; SLOT];
     for t in 0..SLOT {
         x[t] = *a.add(t) ^ *b.add(t);
     }
-    for t in 0..SLOT {
-        *out.add(t) = x[(t + 1) % SLOT];
+    // out[t] = x[(t + 1) % SLOT]; for t < w_out <= SLOT-1 the modulo is a no-op.
+    for t in 0..w_out {
+        *out.add(t) = x[t + 1];
     }
     x[1]
 }
 
 /// AVX2 child producer: one `vpxor` + one `vpermd` (rotate the 8 lanes left by
-/// one) + one store. Replaces the per-word scalar XOR loop.
+/// one), then a masked store of the low `w_out` lanes so the packed, `w_out`-
+/// pitched output never clobbers the next slot.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn xor_child_avx2(out: *mut u32, a: *const u32, b: *const u32) -> u32 {
+unsafe fn xor_child_avx2(out: *mut u32, a: *const u32, b: *const u32, w_out: usize) -> u32 {
     use core::arch::x86_64::*;
     let x = _mm256_xor_si256(
         _mm256_loadu_si256(a as *const __m256i),
@@ -201,7 +218,12 @@ unsafe fn xor_child_avx2(out: *mut u32, a: *const u32, b: *const u32) -> u32 {
     );
     // rotate left by one 32-bit lane: out[i] = x[(i + 1) % 8]
     let p = _mm256_permutevar8x32_epi32(x, _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 0));
-    _mm256_storeu_si256(out as *mut __m256i, p);
+    // mask = lanes [0, w_out) -> all-ones; maskstore writes only those.
+    let mask = _mm256_cmpgt_epi32(
+        _mm256_set1_epi32(w_out as i32),
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+    );
+    _mm256_maskstore_epi32(out as *mut i32, mask, p);
     _mm_cvtsi128_si32(_mm256_castsi256_si128(p)) as u32
 }
 
@@ -383,9 +405,11 @@ fn low_group(keys: &[u32], run: &[u32], hist: &mut [u32], sorted: &mut Vec<u32>)
 /// Monomorphised over the XOR producer so the AVX2 intrinsics inline cleanly
 /// inside a `target_feature` wrapper while sharing one source of truth.
 macro_rules! emit_bucket_body {
-    ($keys:expr, $slots:expr, $sorted:expr, $kout:expr, $sout:expr, $pout:expr, $clamp:expr, $xor:path) => {{
+    ($keys:expr, $slots:expr, $sorted:expr, $kout:expr, $sout:expr, $pout:expr, $clamp:expr, $w_in:expr, $w_out:expr, $xor:path) => {{
         let s = $sorted;
         let m = s.len();
+        let w_in = $w_in;
+        let w_out = $w_out;
         let mut w = 0usize;
         let mut i = 0;
         while i < m {
@@ -400,9 +424,10 @@ macro_rules! emit_bucket_body {
                 for b in (a + 1)..hi {
                     let mr = s[b] as usize;
                     let nk = $xor(
-                        $sout.as_mut_ptr().add(w * SLOT),
-                        $slots.as_ptr().add(l * SLOT),
-                        $slots.as_ptr().add(mr * SLOT),
+                        $sout.as_mut_ptr().add(w * w_out),
+                        $slots.as_ptr().add(l * w_in),
+                        $slots.as_ptr().add(mr * w_in),
+                        w_out,
                     );
                     $kout[w] = nk;
                     $pout[w] = ((l as u64) << 32) | mr as u64;
@@ -423,8 +448,10 @@ unsafe fn emit_bucket_scalar(
     sout: &mut [u32],
     pout: &mut [u64],
     clamp: usize,
+    w_in: usize,
+    w_out: usize,
 ) -> usize {
-    emit_bucket_body!(keys, slots, sorted, kout, sout, pout, clamp, xor_child_scalar)
+    emit_bucket_body!(keys, slots, sorted, kout, sout, pout, clamp, w_in, w_out, xor_child_scalar)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -437,11 +464,14 @@ unsafe fn emit_bucket_avx2(
     sout: &mut [u32],
     pout: &mut [u64],
     clamp: usize,
+    w_in: usize,
+    w_out: usize,
 ) -> usize {
-    emit_bucket_body!(keys, slots, sorted, kout, sout, pout, clamp, xor_child_avx2)
+    emit_bucket_body!(keys, slots, sorted, kout, sout, pout, clamp, w_in, w_out, xor_child_avx2)
 }
 
 /// Emit a partition's children, dispatching to the AVX2 producer when available.
+/// `w_in`/`w_out` are the input/output slot pitches (`w_out == w_in - 1`).
 unsafe fn emit_bucket(
     keys: &[u32],
     slots: &[u32],
@@ -450,22 +480,35 @@ unsafe fn emit_bucket(
     sout: &mut [u32],
     pout: &mut [u64],
     clamp: usize,
+    w_in: usize,
+    w_out: usize,
 ) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            return emit_bucket_avx2(keys, slots, sorted, kout, sout, pout, clamp);
+            return emit_bucket_avx2(keys, slots, sorted, kout, sout, pout, clamp, w_in, w_out);
         }
     }
-    emit_bucket_scalar(keys, slots, sorted, kout, sout, pout, clamp)
+    emit_bucket_scalar(keys, slots, sorted, kout, sout, pout, clamp, w_in, w_out)
 }
 
 /// Group `n` entries by their leading block, then emit one child per colliding
-/// pair: the XOR of the residual blocks (rotated into a fresh 8-word slot) plus
-/// a packed `(l << 32) | mr` back-reference. Two passes — count, then emit
-/// directly into one pre-sized arena — so there is no per-partition allocation
-/// or final concatenation copy. Returns `(keys_out, slots_out, parents)`.
-fn collide(keys: &[u32], slots: &[u32], n: usize, clamp: usize) -> (Vec<u32>, Vec<u32>, Vec<u64>) {
+/// pair: the XOR of the residual blocks (rotated into a fresh slot) plus a packed
+/// `(l << 32) | mr` back-reference. Two passes — count, then emit directly into
+/// one pre-sized arena — so there is no per-partition allocation or final
+/// concatenation copy. Returns `(keys_out, slots_out, parents)`.
+///
+/// `w_in` is the input slot pitch; the round consumes one block, so the output is
+/// packed at `w_out = w_in - 1` words/slot. `slots_out` carries a `SLOT_SLACK`
+/// trailing pad so the next round's 256-bit over-read stays in bounds.
+fn collide(
+    keys: &[u32],
+    slots: &[u32],
+    n: usize,
+    clamp: usize,
+    w_in: usize,
+) -> (Vec<u32>, Vec<u32>, Vec<u64>) {
+    let w_out = w_in - 1;
     // Sub-phase timing, gated on `EQ_PROFILE`. Prints partition / count / alloc /
     // emit splits so we can see which part of the round dominates.
     let prof = std::env::var_os("EQ_PROFILE").is_some();
@@ -493,7 +536,8 @@ fn collide(keys: &[u32], slots: &[u32], n: usize, clamp: usize) -> (Vec<u32>, Ve
     }
     let total = out_starts[TOP_BUCKETS];
     let mut keys_out = vec![0u32; total];
-    let mut slots_out = vec![0u32; total * SLOT];
+    // Packed at `w_out` words/slot, plus a slack pad for the next round's over-read.
+    let mut slots_out = vec![0u32; total * w_out + SLOT_SLACK];
     let mut parents = vec![0u64; total];
 
     // Carve the output arena into disjoint per-partition sub-slices so workers
@@ -505,7 +549,7 @@ fn collide(keys: &[u32], slots: &[u32], n: usize, clamp: usize) -> (Vec<u32>, Ve
         let (mut kr, mut sr, mut pr) = (&mut keys_out[..], &mut slots_out[..], &mut parents[..]);
         for &c in &counts {
             let (kh, kt) = kr.split_at_mut(c);
-            let (sh, st) = sr.split_at_mut(c * SLOT);
+            let (sh, st) = sr.split_at_mut(c * w_out);
             let (ph, pt) = pr.split_at_mut(c);
             kparts.push(kh);
             sparts.push(sh);
@@ -529,7 +573,7 @@ fn collide(keys: &[u32], slots: &[u32], n: usize, clamp: usize) -> (Vec<u32>, Ve
             let mut hist = vec![0u32; LOW_BUCKETS + 1];
             let mut sorted = Vec::new();
             low_group(keys, run, &mut hist, &mut sorted);
-            let w = unsafe { emit_bucket(keys, slots, &sorted, kout, sout, pout, clamp) };
+            let w = unsafe { emit_bucket(keys, slots, &sorted, kout, sout, pout, clamp, w_in, w_out) };
             debug_assert_eq!(w, kout.len());
         });
 
@@ -547,10 +591,10 @@ fn collide(keys: &[u32], slots: &[u32], n: usize, clamp: usize) -> (Vec<u32>, Ve
     (keys_out, slots_out, parents)
 }
 
-/// Final round (slots hold `[w0, w1, …]`): among entries sharing leading block
-/// `w0`, a pair whose `w1` also matches XORs the last two blocks to zero — a
-/// candidate. Returns the `(l, mr)` parents of each candidate.
-fn collide_final(keys: &[u32], slots: &[u32], n: usize, clamp: usize) -> Vec<(u32, u32)> {
+/// Final round (slots hold `[w0, w1, …]` at pitch `w_in`): among entries sharing
+/// leading block `w0`, a pair whose `w1` also matches XORs the last two blocks to
+/// zero — a candidate. Returns the `(l, mr)` parents of each candidate.
+fn collide_final(keys: &[u32], slots: &[u32], n: usize, clamp: usize, w_in: usize) -> Vec<(u32, u32)> {
     let (starts, order) = partition_top(keys, n);
 
     (0..TOP_BUCKETS)
@@ -574,7 +618,7 @@ fn collide_final(keys: &[u32], slots: &[u32], n: usize, clamp: usize) -> Vec<(u3
                         let l = sorted[a] as usize;
                         for b in (a + 1)..hi {
                             let mr = sorted[b] as usize;
-                            if slots[l * SLOT + 1] == slots[mr * SLOT + 1] {
+                            if slots[l * w_in + 1] == slots[mr * w_in + 1] {
                                 local.push((l as u32, mr as u32));
                             }
                         }
@@ -669,19 +713,23 @@ pub fn solve_with(header: &[u8], clamp: Option<usize>) -> Vec<Vec<u32>> {
     phase("round0-hash", n0);
     let mut parents: Vec<Vec<u64>> = Vec::with_capacity(K - 1);
     let mut n = n0;
+    // Round-0 slots carry all SLOT words; each collision round consumes the
+    // leading block, so the next round's slots are one word narrower.
+    let mut width = SLOT;
     for r in 0..(K - 1) {
-        let (ok, os, op) = collide(&keys, &slots, n, clamp);
+        let (ok, os, op) = collide(&keys, &slots, n, clamp, width);
         n = op.len();
         parents.push(op);
         keys = ok;
         slots = os;
+        width -= 1;
         phase(&format!("collide r{}", r + 1), n);
         if n == 0 {
             return Vec::new();
         }
     }
 
-    let candidates = collide_final(&keys, &slots, n, clamp);
+    let candidates = collide_final(&keys, &slots, n, clamp, width);
     phase("collide-final", candidates.len());
     if candidates.is_empty() {
         return Vec::new();
@@ -846,24 +894,32 @@ mod tests {
         assert_eq!(a[0], (src[0] as u32) << 16 | (src[1] as u32) << 8 | src[2] as u32);
     }
 
-    // AVX2 XOR-child (xor + rotate-left-one-lane) must match the scalar version.
+    // The XOR-child producers (scalar + AVX2) must agree for every output width,
+    // write exactly `w_out` words (rotate-left-one of the lane-wise XOR), and
+    // leave the rest of the packed buffer untouched (the AVX2 path masked-stores).
     #[test]
     fn xor_child_matches_scalar() {
+        const SENT: u32 = 0xDEAD_BEEF;
         let pa: [u32; SLOT] = [9, 8, 7, 6, 5, 4, 3, 2];
         let pb: [u32; SLOT] = [1, 2, 3, 4, 5, 6, 7, 8];
-        let mut o1 = [0u32; SLOT];
-        let mut o2 = [0u32; SLOT];
-        let k1 = unsafe { xor_child_scalar(o1.as_mut_ptr(), pa.as_ptr(), pb.as_ptr()) };
-        // Reference: rotate-left-one of the lane-wise XOR; new key = lane 1.
         let x: Vec<u32> = (0..SLOT).map(|i| pa[i] ^ pb[i]).collect();
-        let expect: Vec<u32> = (0..SLOT).map(|i| x[(i + 1) % SLOT]).collect();
-        assert_eq!(&o1[..], &expect[..]);
-        assert_eq!(k1, x[1]);
-        #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx2") {
-            let k2 = unsafe { xor_child_avx2(o2.as_mut_ptr(), pa.as_ptr(), pb.as_ptr()) };
-            assert_eq!(o1, o2, "avx2 xor_child != scalar");
-            assert_eq!(k1, k2);
+        for w_out in 1..SLOT {
+            let mut o1 = [SENT; SLOT];
+            let k1 = unsafe { xor_child_scalar(o1.as_mut_ptr(), pa.as_ptr(), pb.as_ptr(), w_out) };
+            for t in 0..w_out {
+                assert_eq!(o1[t], x[(t + 1) % SLOT], "scalar word {t} (w_out={w_out})");
+            }
+            for t in w_out..SLOT {
+                assert_eq!(o1[t], SENT, "scalar wrote past w_out at {t} (w_out={w_out})");
+            }
+            assert_eq!(k1, x[1]);
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") {
+                let mut o2 = [SENT; SLOT];
+                let k2 = unsafe { xor_child_avx2(o2.as_mut_ptr(), pa.as_ptr(), pb.as_ptr(), w_out) };
+                assert_eq!(o1, o2, "avx2 xor_child != scalar (w_out={w_out})");
+                assert_eq!(k1, k2);
+            }
         }
     }
 
