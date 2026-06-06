@@ -165,6 +165,21 @@ fn grouped(cores: &[usize], size: usize, enabled: &BTreeSet<usize>) -> Arc<CpuGr
     groups
 }
 
+/// Largest cores-per-row the dashboard allows, by total core count. Finer
+/// control on small machines, coarser on big ones so the toggleable-row count
+/// stays manageable: **≤4 cores** toggle individually (size 1), **5-8 cores** in
+/// groups of up to 2, and **more than 8** in groups of up to 4. This caps both
+/// the starting group size and the 'g' cycle.
+fn max_group_size(cores: usize) -> usize {
+    if cores <= 4 {
+        1
+    } else if cores <= 8 {
+        2
+    } else {
+        4
+    }
+}
+
 /// Live controller for CPU mining. Owns the selected cores plus the current
 /// group size, and rebuilds the [`CpuGroups`] when the size is cycled from the
 /// dashboard (the worker supervisor watches `group_size()` and respawns to
@@ -188,14 +203,16 @@ impl CpuMining {
     /// the starting group size (`--cpu-group-size`), and `start_enabled` whether
     /// mining begins on (`--cpu-mining`).
     pub fn new(cores: Vec<usize>, initial_size: usize, start_enabled: bool) -> Arc<Self> {
-        let initial_size = initial_size.max(1);
+        // Toggle granularity scales with core count so the row count stays
+        // manageable (see [`max_group_size`]): the cap bounds both the starting
+        // size and the dashboard 'g' cycle.
+        let cap = max_group_size(cores.len());
+        let initial_size = initial_size.clamp(1, cap);
         let enabled: BTreeSet<usize> = if start_enabled { cores.iter().copied().collect() } else { BTreeSet::new() };
         let groups = grouped(&cores, initial_size, &enabled);
 
-        // Cycle list: the usual powers of two plus the requested size, capped so a
-        // group never exceeds the core count (unless the user explicitly asked for
-        // a larger size), sorted and de-duplicated.
-        let cap = cores.len().max(initial_size).max(1);
+        // Cycle list: powers of two from 1 up to the cap, plus the (clamped)
+        // requested size, sorted and de-duplicated.
         let mut sizes: Vec<usize> = [1usize, 2, 4, 8]
             .into_iter()
             .chain([initial_size])
@@ -346,39 +363,67 @@ mod tests {
     }
 
     #[test]
-    fn cpu_mining_cycles_size_and_preserves_enabled_cores() {
-        // 8 cores, start at size 4 fully enabled -> two groups [0-3],[4-7], both on.
-        let m = CpuMining::new((0..8).collect(), 4, true);
+    fn group_size_tier_by_core_count() {
+        // ≤4 cores: individual cores only — size 1, no larger option.
+        let m = CpuMining::new((0..4).collect(), 4, false); // requested 4 clamps to 1
+        assert_eq!(m.group_size(), 1);
+        assert_eq!(m.groups().len(), 4);
+        m.cycle_group_size();
+        assert_eq!(m.group_size(), 1); // only one size, cycle is a no-op
+
+        // 5-8 cores: groups of up to 2 (requested 4 clamps to 2).
+        let m = CpuMining::new((0..8).collect(), 4, false);
+        assert_eq!(m.group_size(), 2);
+        assert_eq!(m.groups().len(), 4);
+        m.cycle_group_size();
+        assert_eq!(m.group_size(), 1); // cycle covers {1, 2}
+
+        // >8 cores: groups of up to 4 (the default).
+        let m = CpuMining::new((0..16).collect(), 4, false);
         assert_eq!(m.group_size(), 4);
-        assert_eq!(m.groups().len(), 2);
+        assert_eq!(m.groups().len(), 4);
+        // A larger explicit request is still capped at the tier max.
+        let m = CpuMining::new((0..16).collect(), 8, false);
+        assert_eq!(m.group_size(), 4);
+    }
+
+    #[test]
+    fn cpu_mining_cycles_size_and_preserves_enabled_cores() {
+        // 16 cores (tier cap 4): start at size 4 fully enabled -> four groups,
+        // all on.
+        let m = CpuMining::new((0..16).collect(), 4, true);
+        assert_eq!(m.group_size(), 4);
+        assert_eq!(m.groups().len(), 4);
         assert!(m.groups().iter().all(|g| g.enabled()));
 
-        // Disable the second group (cores 4-7): now only cores 0-3 are enabled.
-        m.toggle_group(1);
-        assert!(m.groups().group(0).enabled());
-        assert!(!m.groups().group(1).enabled());
+        // Disable the last group (cores 12-15): now only cores 0-11 are enabled.
+        m.toggle_group(3);
+        assert!(!m.groups().group(3).enabled());
 
-        // Cycle to size 8 and rebuild: the single [0-7] group is off, because not
-        // all of its cores were enabled.
-        while m.group_size() != 8 {
+        // Cycle to size 1 (individual cores) and rebuild: 16 rows; cores 0-11 on,
+        // 12-15 off.
+        while m.group_size() != 1 {
             m.cycle_group_size();
         }
         let g = m.rebuild();
-        assert_eq!(g.len(), 1);
-        assert!(!g.group(0).enabled());
+        assert_eq!(g.len(), 16);
+        assert!(g.group(0).enabled()); // core 0
+        assert!(g.group(11).enabled()); // core 11
+        assert!(!g.group(12).enabled()); // core 12
+        assert!(!g.group(15).enabled()); // core 15
 
-        // Cycle to size 2 and rebuild: cores 0-3 are still tracked as enabled, so
-        // [0,1] and [2,3] come back on while [4,5] and [6,7] stay off — the choice
-        // survived two regroups (not derived from the all-off size-8 grouping).
+        // Cycle to size 2 and rebuild: cores 0-11 are still tracked as enabled, so
+        // [0,1]..[10,11] come back on while [12,13],[14,15] stay off — the choice
+        // survived two regroups.
         while m.group_size() != 2 {
             m.cycle_group_size();
         }
         let g = m.rebuild();
-        assert_eq!(g.len(), 4);
+        assert_eq!(g.len(), 8);
         assert!(g.group(0).enabled()); // [0,1]
-        assert!(g.group(1).enabled()); // [2,3]
-        assert!(!g.group(2).enabled()); // [4,5]
-        assert!(!g.group(3).enabled()); // [6,7]
+        assert!(g.group(5).enabled()); // [10,11]
+        assert!(!g.group(6).enabled()); // [12,13]
+        assert!(!g.group(7).enabled()); // [14,15]
         assert!(m.generation() >= 2);
     }
 

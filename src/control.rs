@@ -175,15 +175,15 @@ mod tests {
     #[test]
     fn protocol_get_and_set() {
         let controls = Controls::new(1, 0, 0, 0, 0, true);
-        let cpu = CpuMining::new((0..8).collect(), 4, false); // sizes [1,2,4,8]
+        let cpu = CpuMining::new((0..16).collect(), 4, false); // 16 cores -> tier cap 4, sizes [1,2,4]
         let stats = Stats::for_test(vec!["GPU 0".into()]);
 
-        // get: one device, cpu rows reflect the grouping (8 cores / 4 = 2 rows).
+        // get: one device, cpu rows reflect the grouping (16 cores / 4 = 4 rows).
         let v = process("{\"op\":\"get\"}", &controls, &cpu, &stats);
         assert_eq!(v["ok"], true);
         assert_eq!(v["devices"].as_array().unwrap().len(), 1);
         assert_eq!(v["cpu"]["group_size"], 4);
-        assert_eq!(v["cpu"]["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(v["cpu"]["rows"].as_array().unwrap().len(), 4);
 
         // set device 0 disabled.
         assert!(controls.device(0).enabled());

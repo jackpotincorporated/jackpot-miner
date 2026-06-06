@@ -125,11 +125,12 @@ struct Args {
     #[arg(long, value_name = "SPEC")]
     cpu_cores: Option<String>,
 
-    /// Cores per CPU mining row (default 4). Each row runs one shared solve
-    /// across its cores; larger groups cut memory sharply: total RAM is ~4 GB ×
-    /// (enabled cores / this size). Use 1 for one row (and one solve) per core.
-    /// Rows are aligned to core-index blocks of this size, so a row never
-    /// straddles a boundary. Cycle it live in the dashboard with 'g'.
+    /// Cores per CPU mining row. Each row runs one shared solve across its
+    /// cores; larger groups cut memory sharply: total RAM is ~4 GB × (enabled
+    /// cores / this size). Rows align to core-index blocks of this size. Capped
+    /// by core count so the row count stays manageable — ≤4 cores toggle
+    /// individually (1), 5-8 cores in groups of ≤2, more than 8 in groups of ≤4
+    /// — and the default is that cap. Cycle it live (within the cap) with 'g'.
     #[arg(long, value_name = "N", default_value_t = 4)]
     cpu_group_size: usize,
 
