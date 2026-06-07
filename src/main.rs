@@ -18,6 +18,10 @@ mod gpu;
 #[cfg(feature = "gpu")]
 mod gpu_amd;
 
+// AMD GPU telemetry via Linux amdgpu sysfs (a `gpu_tune::GpuTuner` backend).
+#[cfg(feature = "gpu")]
+mod amd_smi;
+
 // Runtime dynamic-library loader (dlopen) for the CUDA driver + NVML.
 #[cfg(feature = "cuda")]
 mod dylib;
@@ -28,7 +32,9 @@ mod cuda;
 #[cfg(feature = "cuda")]
 mod nvml;
 
-#[cfg(feature = "cuda")]
+// Platform-agnostic GPU tuning/telemetry surface. The trait + policy compile for
+// either GPU backend; NVML (cuda) and amd_smi (gpu) are the implementations.
+#[cfg(any(feature = "cuda", feature = "gpu"))]
 mod gpu_tune;
 
 use std::io::IsTerminal;
@@ -203,6 +209,13 @@ struct Args {
     /// fastest stable solve rate (overclock-for-speed; needs root). Takes ~30 s.
     #[arg(long)]
     auto_tune: bool,
+
+    /// Sustained-Sol/s governor: hold each GPU at/below this edge temperature (°C)
+    /// by pacing the solve cadence (no hardware writes, no root). Trades a little
+    /// throughput for lower temp/power; off by default (runs flat-out). Needs a
+    /// backend that reports temperature (AMD amdgpu / NVIDIA).
+    #[arg(long, value_name = "CELSIUS")]
+    target_temp: Option<u32>,
 
     /// Efficiency: cap each GPU's power limit in watts (default: card max).
     /// Lower power trades a little hashrate for much better Sol/W.
@@ -620,6 +633,8 @@ fn main() -> Result<()> {
         args.power_limit.unwrap_or(0),
         args.unlock_controls,
     );
+    // Software temp governor target (paces solve cadence; no hardware writes).
+    miner::set_target_temp(args.target_temp);
     miner::run(client, specs, running, job_timeout, tui, format!("{host}:{port}"), controls, cpu_mining, cpu_clamp, args.control_port)
 }
 
@@ -1077,10 +1092,21 @@ fn benchmark(specs: Vec<BackendSpec>, runs: usize) -> Result<()> {
     use std::time::Instant;
     info!("benchmarking {runs} solve(s) per worker across {} worker(s)", specs.len());
 
+    /// Per-worker benchmark result, including a steady-state telemetry snapshot
+    /// (sampled right after the timed loop, while the card is warm).
+    struct WorkerResult {
+        sols: usize,
+        dt: f64,
+        watts: Option<f64>,
+        temp_c: Option<u32>,
+        core_mhz: Option<u32>,
+        mem_mhz: Option<u32>,
+    }
+
     let start = Instant::now();
     let mut handles = Vec::new();
     for (id, spec) in specs.into_iter().enumerate() {
-        handles.push(std::thread::spawn(move || -> Result<(usize, f64)> {
+        handles.push(std::thread::spawn(move || -> Result<WorkerResult> {
             let backend = spec.build()?;
             backend.solve(&pseudo_header(id as u64))?; // warm up (excluded)
             let t = Instant::now();
@@ -1090,7 +1116,17 @@ fn benchmark(specs: Vec<BackendSpec>, runs: usize) -> Result<()> {
                 let seed = ((id as u64) << 40) | (i as u64 + 1);
                 sols += backend.solve(&pseudo_header(seed))?.len();
             }
-            Ok((sols, t.elapsed().as_secs_f64()))
+            let dt = t.elapsed().as_secs_f64();
+            // Snapshot telemetry while the card is still under load.
+            let (core_mhz, mem_mhz) = backend.current_clocks_mhz();
+            Ok(WorkerResult {
+                sols,
+                dt,
+                watts: backend.power_watts(),
+                temp_c: backend.temperature_c(),
+                core_mhz,
+                mem_mhz,
+            })
         }));
     }
 
@@ -1099,11 +1135,26 @@ fn benchmark(specs: Vec<BackendSpec>, runs: usize) -> Result<()> {
     let mut workers = 0usize;
     for h in handles {
         match h.join().unwrap() {
-            Ok((sols, dt)) => {
-                let sol_s = sols as f64 / dt;
+            Ok(r) => {
+                let sol_s = r.sols as f64 / r.dt;
+                // Optional telemetry tail: " | 142 W, 41.7 Sol/W, 68°C, 2700/2500 MHz".
+                let mut tail = String::new();
+                if let Some(w) = r.watts {
+                    tail.push_str(&format!(" | {w:.0} W"));
+                    if w > 0.0 {
+                        tail.push_str(&format!(", {:.2} Sol/W", sol_s / w));
+                    }
+                }
+                if let Some(t) = r.temp_c {
+                    tail.push_str(&format!(", {t}°C"));
+                }
+                if let (Some(c), m) = (r.core_mhz, r.mem_mhz) {
+                    tail.push_str(&format!(", {c}/{} MHz", m.map(|m| m.to_string()).unwrap_or_else(|| "?".into())));
+                }
                 info!(
-                    "  worker {workers}: {sol_s:.2} Sol/s ({:.0} ms/solve), {sols} solutions",
-                    1000.0 * dt / runs as f64
+                    "  worker {workers}: {sol_s:.2} Sol/s ({:.0} ms/solve), {} solutions{tail}",
+                    1000.0 * r.dt / runs as f64,
+                    r.sols
                 );
                 agg_sols += sol_s;
                 workers += 1;

@@ -14,6 +14,22 @@ use crate::equihash;
 use crate::params::{HEADER_LEN, SOLUTION_BYTES};
 use crate::stratum::{StratumClient, Work};
 
+/// Process-wide target edge temperature (°C) for the software solve-cadence
+/// governor; `None` ⇒ run flat-out. Set once at startup from `--target-temp`.
+static TARGET_TEMP_C: OnceLock<Option<u32>> = OnceLock::new();
+
+/// Install the governor's target temperature (call once, before workers start).
+pub fn set_target_temp(c: Option<u32>) {
+    if let Some(t) = c {
+        info!("temperature governor enabled: holding GPUs ≤{t}°C (paced cadence)");
+    }
+    let _ = TARGET_TEMP_C.set(c);
+}
+
+fn target_temp_c() -> Option<u32> {
+    TARGET_TEMP_C.get().copied().flatten()
+}
+
 /// Double SHA-256, as used for the Zcash/ZClassic block PoW hash.
 fn sha256d(data: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(data);
@@ -136,6 +152,8 @@ impl Backend {
         match self {
             #[cfg(feature = "cuda")]
             Backend::Cuda(solver) => solver.power_watts(),
+            #[cfg(feature = "gpu")]
+            Backend::Gpu(solver) => solver.power_watts(),
             _ => None,
         }
     }
@@ -145,6 +163,8 @@ impl Backend {
         match self {
             #[cfg(feature = "cuda")]
             Backend::Cuda(solver) => solver.temperature_c(),
+            #[cfg(feature = "gpu")]
+            Backend::Gpu(solver) => solver.temperature_c(),
             _ => None,
         }
     }
@@ -154,6 +174,8 @@ impl Backend {
         match self {
             #[cfg(feature = "cuda")]
             Backend::Cuda(solver) => solver.current_power_limit_w(),
+            #[cfg(feature = "gpu")]
+            Backend::Gpu(solver) => solver.current_power_limit_w(),
             _ => None,
         }
     }
@@ -163,6 +185,8 @@ impl Backend {
         match self {
             #[cfg(feature = "cuda")]
             Backend::Cuda(solver) => solver.power_limit_range_w(),
+            #[cfg(feature = "gpu")]
+            Backend::Gpu(solver) => solver.power_limit_range_w(),
             _ => None,
         }
     }
@@ -190,6 +214,8 @@ impl Backend {
         match self {
             #[cfg(feature = "cuda")]
             Backend::Cuda(solver) => solver.current_clocks_mhz(),
+            #[cfg(feature = "gpu")]
+            Backend::Gpu(solver) => solver.current_clocks_mhz(),
             _ => (None, None),
         }
     }
@@ -513,6 +539,14 @@ fn worker(
     let mut last_job = Instant::now();
     let mut paused = false;
     let mut disabled_pause = false;
+    // Software temperature governor: pace the solve cadence to hold edge temp at
+    // or below `--target-temp` (no hardware writes). `gov_sleep` is the per-pass
+    // pause, nudged from the periodic temperature sample.
+    let gov_target = target_temp_c();
+    let mut gov_sleep = Duration::ZERO;
+    if let Some(target) = gov_target {
+        info!("worker {id}: temperature governor active — pacing cadence to hold ≤{target}°C");
+    }
 
     while running.load(Ordering::Relaxed) {
         if work_handle.epoch() != current.epoch {
@@ -583,6 +617,9 @@ fn worker(
             }
             if let Some(t) = backend.temperature_c() {
                 stats.workers[id].temp_c.store(t, Ordering::Relaxed);
+                if let Some(target) = gov_target {
+                    gov_sleep = govern_cadence(gov_sleep, t, target);
+                }
             }
             let (core_mhz, mem_mhz) = backend.current_clocks_mhz();
             if let Some(c) = core_mhz {
@@ -614,10 +651,32 @@ fn worker(
             let ctx = inflight.pop_front().unwrap();
             process_results(id, &client, &ctx, &solutions, &stats);
         }
+
+        // Temperature governor: pace the cadence (held off entirely when flat-out).
+        if !gov_sleep.is_zero() {
+            std::thread::sleep(gov_sleep);
+        }
     }
 
     drain_pipeline(id, &mut backend, &mut inflight, &client, &stats)?;
     Ok(())
+}
+
+/// Nudge the per-pass governor pause to hold edge temperature near `target` (°C).
+/// Over target → lengthen the pause (proportional to the overshoot); comfortably
+/// under → shorten it. Called from the periodic temperature sample (~1 Hz), so
+/// this is a slow integral controller — fine for the card's thermal time constant.
+fn govern_cadence(cur: Duration, temp: u32, target: u32) -> Duration {
+    const MAX_SLEEP: Duration = Duration::from_millis(100);
+    let (t, target) = (temp as i64, target as i64);
+    if t > target {
+        cur.saturating_add(Duration::from_micros(400 * (t - target) as u64))
+            .min(MAX_SLEEP)
+    } else if t < target - 1 {
+        cur.saturating_sub(Duration::from_millis(1))
+    } else {
+        cur
+    }
 }
 
 /// Supervise CPU mining: spawn one worker per group for the current group size,
@@ -842,4 +901,50 @@ fn build_nonce(nonce1: &[u8], counter: u64) -> Result<[u8; 32]> {
     let n = tail.len().min(8);
     tail[..n].copy_from_slice(&counter.to_le_bytes()[..n]);
     Ok(nonce)
+}
+
+#[cfg(test)]
+mod governor_tests {
+    use super::*;
+
+    #[test]
+    fn governor_idles_below_target() {
+        // At/under target → no pause is introduced.
+        assert_eq!(govern_cadence(Duration::ZERO, 60, 70), Duration::ZERO);
+        assert_eq!(govern_cadence(Duration::ZERO, 70, 70), Duration::ZERO);
+    }
+
+    #[test]
+    fn governor_lengthens_over_target_and_clamps() {
+        // Over target → pause grows proportional to the overshoot.
+        let s = govern_cadence(Duration::ZERO, 75, 70); // +5°C
+        assert_eq!(s, Duration::from_micros(400 * 5));
+        // Far over target saturates at the cap, never beyond.
+        let hot = govern_cadence(Duration::from_millis(99), 200, 70);
+        assert_eq!(hot, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn governor_eases_off_when_cool() {
+        // 2°C+ under target → pause shrinks; floors at zero (no underflow).
+        let s = govern_cadence(Duration::from_millis(3), 67, 70);
+        assert_eq!(s, Duration::from_millis(2));
+        assert_eq!(govern_cadence(Duration::ZERO, 50, 70), Duration::ZERO);
+    }
+
+    #[test]
+    fn governor_converges_to_hold_target() {
+        // Simulate a card whose temp rises with duty: more pause → cooler. The
+        // controller should settle near the target without runaway.
+        let target = 70u32;
+        let mut sleep = Duration::ZERO;
+        let mut temp = 85i32; // starts hot
+        for _ in 0..200 {
+            sleep = govern_cadence(sleep, temp as u32, target);
+            // crude plant: each ms of pause sheds ~1.5°C off a 90°C flat-out temp.
+            let modeled = 90.0 - 1.5 * sleep.as_millis() as f64;
+            temp = modeled.round() as i32;
+        }
+        assert!((target as i32 - 2..=target as i32 + 2).contains(&temp), "settled at {temp}°C, want ~{target}");
+    }
 }

@@ -411,6 +411,9 @@ impl LegacySolver {
 /// (`equihash.cl`) everywhere else. Forceable with `ZCL_OPENCL_KERNEL=amd|legacy`.
 pub struct GpuSolver {
     inner: SolverInner,
+    /// Per-card telemetry handle (AMD amdgpu sysfs / NVML), matched to the device
+    /// by PCI bus id. `None` when no telemetry backend matches.
+    tuner: Option<Box<dyn crate::gpu_tune::GpuTuner>>,
 }
 
 enum SolverInner {
@@ -423,13 +426,16 @@ impl GpuSolver {
     /// device vendor (AMD → `equihash192_7.cl`).
     pub fn new(device_index: usize) -> Result<Self> {
         let (platform, device) = pick_device(device_index)?;
+        // Resolve a telemetry handle (AMD sysfs / NVML) from the device's PCI bus
+        // before `device` is consumed by the inner solver.
+        let tuner = device_pci_bus_id(&device).and_then(|bus| crate::gpu_tune::open(&bus));
         let inner = if use_amd_kernel(&device) {
             log::info!("OpenCL: AMD device — using the equihash192_7 kernel");
             SolverInner::Amd(crate::gpu_amd::AmdSolver::new(platform, device)?)
         } else {
             SolverInner::Legacy(LegacySolver::new(platform, device)?)
         };
-        Ok(Self { inner })
+        Ok(Self { inner, tuner })
     }
 
     /// This device's product name, if available.
@@ -437,6 +443,34 @@ impl GpuSolver {
         match &self.inner {
             SolverInner::Legacy(s) => s.device_name(),
             SolverInner::Amd(s) => s.device_name(),
+        }
+    }
+
+    /// Current board power draw in watts (telemetry handle), if available.
+    pub fn power_watts(&self) -> Option<f64> {
+        self.tuner.as_ref().and_then(|t| t.watts())
+    }
+
+    /// Current GPU temperature in °C, if available.
+    pub fn temperature_c(&self) -> Option<u32> {
+        self.tuner.as_ref().and_then(|t| t.temperature_c())
+    }
+
+    /// Currently enforced power limit in watts, if available.
+    pub fn current_power_limit_w(&self) -> Option<u32> {
+        self.tuner.as_ref().and_then(|t| t.current_power_limit_w())
+    }
+
+    /// (min, max) settable power limit in watts, if available.
+    pub fn power_limit_range_w(&self) -> Option<(u32, u32)> {
+        self.tuner.as_ref().and_then(|t| t.power_limit_range_w())
+    }
+
+    /// Current (core, memory) clocks in MHz, each `None` if unavailable.
+    pub fn current_clocks_mhz(&self) -> (Option<u32>, Option<u32>) {
+        match &self.tuner {
+            Some(t) => (t.core_clock_mhz(), t.mem_clock_mhz()),
+            None => (None, None),
         }
     }
 
@@ -475,11 +509,32 @@ impl GpuSolver {
     pub fn hash_all(&self, header: &[u8]) -> Result<Vec<u8>> {
         match &self.inner {
             SolverInner::Legacy(s) => s.hash_all(header),
-            SolverInner::Amd(_) => {
-                Err(anyhow!("hash_all is not supported by the AMD kernel"))
-            }
+            SolverInner::Amd(_) => Err(anyhow!("hash_all is not supported by the AMD kernel")),
         }
     }
+}
+
+/// The device's PCI address as `"DDDD:BB:DD.F"` (lowercase), for matching the
+/// physical card to a telemetry backend. Prefers `cl_khr_pci_bus_info`; falls
+/// back to `cl_device_topology_amd`. `None` if the device exposes neither.
+fn device_pci_bus_id(device: &ocl::Device) -> Option<String> {
+    const CL_DEVICE_PCI_BUS_INFO_KHR: u32 = 0x10F2;
+    const CL_DEVICE_TOPOLOGY_AMD: u32 = 0x4037;
+    // cl_device_pci_bus_info_khr = { u32 pci_domain, pci_bus, pci_device, pci_function }.
+    if let Ok(b) = device.info_raw(CL_DEVICE_PCI_BUS_INFO_KHR) {
+        if b.len() >= 16 {
+            let rd = |i: usize| u32::from_ne_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+            return Some(format!("{:04x}:{:02x}:{:02x}.{:x}", rd(0), rd(4), rd(8), rd(12)));
+        }
+    }
+    // cl_device_topology_amd (PCIE branch): 24-byte struct, bus/device/function
+    // are the last three bytes; domain isn't exposed (assume 0000).
+    if let Ok(b) = device.info_raw(CL_DEVICE_TOPOLOGY_AMD) {
+        if b.len() >= 24 {
+            return Some(format!("0000:{:02x}:{:02x}.{:x}", b[21], b[22], b[23]));
+        }
+    }
+    None
 }
 
 /// Decide whether to drive `device` with the AMD `equihash192_7.cl` kernel.
@@ -561,7 +616,7 @@ pub fn cpu_device_index() -> Option<usize> {
 /// Resolve a flat device index across all platforms, returning the device along
 /// with the platform it belongs to (needed to build the context against the
 /// right platform).
-fn pick_device(index: usize) -> Result<(ocl::Platform, ocl::Device)> {
+pub(crate) fn pick_device(index: usize) -> Result<(ocl::Platform, ocl::Device)> {
     use ocl::{Device, Platform};
     let mut idx = 0;
     for platform in Platform::list() {

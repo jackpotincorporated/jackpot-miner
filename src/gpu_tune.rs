@@ -128,18 +128,24 @@ pub trait GpuTuner: Send {
 /// Open a control handle for the GPU at `pci_bus_id` (matches the physical card
 /// regardless of CUDA-vs-driver index ordering). `None` if unavailable.
 ///
-/// NVML is the backend on both Linux (`libnvidia-ml`) and Windows (`nvml.dll`);
-/// the C API is identical, so the same [`crate::nvml`] code serves both.
+/// Tries the NVIDIA backend first (NVML, `libnvidia-ml`/`nvml.dll`), then the AMD
+/// backend ([`crate::amd_smi`], Linux amdgpu sysfs). A non-matching bus id makes
+/// each backend return `None`, so probing both is safe on mixed-vendor hosts.
 pub fn open(pci_bus_id: &str) -> Option<Box<dyn GpuTuner>> {
-    #[cfg(any(unix, windows))]
+    #[cfg(feature = "cuda")]
     {
-        crate::nvml::open(pci_bus_id)
+        if let Some(t) = crate::nvml::open(pci_bus_id) {
+            return Some(t);
+        }
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(feature = "gpu")]
     {
-        let _ = pci_bus_id;
-        None
+        if let Some(t) = crate::amd_smi::open(pci_bus_id) {
+            return Some(t);
+        }
     }
+    let _ = pci_bus_id;
+    None
 }
 
 static WARNED_PRIVS: AtomicBool = AtomicBool::new(false);
