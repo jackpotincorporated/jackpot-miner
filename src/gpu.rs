@@ -556,19 +556,81 @@ fn use_amd_kernel(device: &ocl::Device) -> bool {
     }
 }
 
-/// List `(platform, device)` names so the user can choose `--device`.
-pub fn list_devices() -> Result<Vec<String>> {
-    use ocl::{Device, Platform};
-    let mut names = Vec::new();
-    let mut idx = 0;
-    for platform in Platform::list() {
-        let pname = platform.name().unwrap_or_else(|_| "?".into());
-        for device in Device::list_all(platform).unwrap_or_default() {
-            let dname = device.name().unwrap_or_else(|_| "?".into());
-            names.push(format!("[{idx}] {pname} / {dname}"));
-            idx += 1;
+/// A cross-platform key identifying the physical GPU, as a canonical PCI address
+/// `"DDDD:BB:DD.F"`. Vendor runtimes (ROCm/NVIDIA) expose `cl_khr_pci_bus_info`;
+/// rusticl/Mesa doesn't, but its `cl_khr_device_uuid` *encodes* the PCI address
+/// ({u32 domain LE, u8 bus, u8 device, u8 function, ...}), so the same physical
+/// card yields the same key on both platforms. `None` if neither is available
+/// (then the device is never deduped — safe).
+fn device_dedup_key(device: &ocl::Device) -> Option<String> {
+    if let Some(pci) = device_pci_bus_id(device) {
+        return Some(pci);
+    }
+    const CL_DEVICE_UUID_KHR: u32 = 0x106A;
+    if let Ok(b) = device.info_raw(CL_DEVICE_UUID_KHR) {
+        if b.len() >= 7 {
+            let domain = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            return Some(format!("{:04x}:{:02x}:{:02x}.{:x}", domain, b[4], b[5], b[6]));
         }
     }
+    None
+}
+
+/// Lower = preferred when the same physical GPU is exposed by multiple OpenCL
+/// platforms. De-prioritise the Mesa Gallium drivers (rusticl/clover) relative to
+/// the vendor runtimes (ROCm / NVIDIA / Intel), which are faster and complete.
+fn platform_rank(p: &ocl::Platform) -> u8 {
+    let name = p.name().unwrap_or_default().to_ascii_lowercase();
+    if name.contains("rusticl") || name.contains("clover") || name.contains("mesa") {
+        1
+    } else {
+        0
+    }
+}
+
+/// All usable OpenCL `(platform, device)` pairs in a stable flat order, with each
+/// physical GPU de-duplicated across platforms by PCI bus id — a card exposed by
+/// both ROCm and rusticl appears once (the vendor runtime wins over Mesa), so
+/// mining "all" doesn't run the same card twice. This is the single source of
+/// truth for the flat device index used by `--devices`, `--list-devices`, and
+/// [`pick_device`]. Devices without a PCI bus id (CPU / PoCL) are never deduped.
+fn enumerate_devices() -> Vec<(ocl::Platform, ocl::Device)> {
+    use ocl::{Device, Platform};
+    let mut out: Vec<(Platform, Device)> = Vec::new();
+    let mut by_pci: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for platform in Platform::list() {
+        for device in Device::list_all(platform).unwrap_or_default() {
+            match device_dedup_key(&device) {
+                Some(pci) => match by_pci.get(&pci).copied() {
+                    // Same physical GPU already listed: keep the preferred platform.
+                    Some(existing) => {
+                        if platform_rank(&platform) < platform_rank(&out[existing].0) {
+                            out[existing] = (platform, device);
+                        }
+                    }
+                    None => {
+                        by_pci.insert(pci, out.len());
+                        out.push((platform, device));
+                    }
+                },
+                None => out.push((platform, device)), // no PCI id → can't dedup
+            }
+        }
+    }
+    out
+}
+
+/// List `(platform, device)` names so the user can choose `--device`.
+pub fn list_devices() -> Result<Vec<String>> {
+    let names = enumerate_devices()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (platform, device))| {
+            let pname = platform.name().unwrap_or_else(|_| "?".into());
+            let dname = device.name().unwrap_or_else(|_| "?".into());
+            format!("[{idx}] {pname} / {dname}")
+        })
+        .collect();
     Ok(names)
 }
 
@@ -577,18 +639,15 @@ pub fn list_devices() -> Result<Vec<String>> {
 /// hand NVIDIA cards to CUDA (and mine only the non-NVIDIA OpenCL devices).
 pub fn device_is_nvidia() -> Vec<bool> {
     use ocl::enums::{DeviceInfo, DeviceInfoResult};
-    use ocl::{Device, Platform};
-    let mut out = Vec::new();
-    for platform in Platform::list() {
-        for device in Device::list_all(platform).unwrap_or_default() {
-            let is_nv = matches!(
+    enumerate_devices()
+        .into_iter()
+        .map(|(_, device)| {
+            matches!(
                 device.info(DeviceInfo::Vendor),
                 Ok(DeviceInfoResult::Vendor(v)) if v.to_ascii_lowercase().contains("nvidia")
-            );
-            out.push(is_nv);
-        }
-    }
-    out
+            )
+        })
+        .collect()
 }
 
 /// The flat OpenCL device index of the first CPU-type device (e.g. PoCL), if any.
@@ -596,36 +655,20 @@ pub fn device_is_nvidia() -> Vec<bool> {
 /// [`list_devices`] / `--devices`.
 pub fn cpu_device_index() -> Option<usize> {
     use ocl::enums::{DeviceInfo, DeviceInfoResult};
-    use ocl::{Device, Platform};
-    let mut idx = 0;
-    for platform in Platform::list() {
-        for device in Device::list_all(platform).unwrap_or_default() {
-            let is_cpu = matches!(
-                device.info(DeviceInfo::Type).ok(),
-                Some(DeviceInfoResult::Type(t)) if t.contains(ocl::flags::DeviceType::CPU)
-            );
-            if is_cpu {
-                return Some(idx);
-            }
-            idx += 1;
-        }
-    }
-    None
+    enumerate_devices().into_iter().position(|(_, device)| {
+        matches!(
+            device.info(DeviceInfo::Type).ok(),
+            Some(DeviceInfoResult::Type(t)) if t.contains(ocl::flags::DeviceType::CPU)
+        )
+    })
 }
 
-/// Resolve a flat device index across all platforms, returning the device along
-/// with the platform it belongs to (needed to build the context against the
-/// right platform).
+/// Resolve a flat device index (into the de-duplicated [`enumerate_devices`]
+/// list), returning the device along with the platform it belongs to (needed to
+/// build the context against the right platform).
 pub(crate) fn pick_device(index: usize) -> Result<(ocl::Platform, ocl::Device)> {
-    use ocl::{Device, Platform};
-    let mut idx = 0;
-    for platform in Platform::list() {
-        for device in Device::list_all(platform).unwrap_or_default() {
-            if idx == index {
-                return Ok((platform, device));
-            }
-            idx += 1;
-        }
-    }
-    Err(anyhow!("no OpenCL device with index {index}"))
+    enumerate_devices()
+        .into_iter()
+        .nth(index)
+        .ok_or_else(|| anyhow!("no OpenCL device with index {index}"))
 }
