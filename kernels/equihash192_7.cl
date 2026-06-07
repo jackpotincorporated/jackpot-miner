@@ -2,8 +2,6 @@
 
 //#define PRINT 1
 
-#pragma OPENCL EXTENSION cl_khr_fp64 : enable
-
 __constant ulong blake_iv[] =
 {
     0x6a09e667f3bcc908, 0xbb67ae8584caa73b,
@@ -507,14 +505,22 @@ uint compress2(uint in0, uint in1) {
 	return tmp;	
 }
 
-uint2 decompress(uint2 in) {
-	double inFl = (double) (in.s0 >> 6);
-	
-	inFl *= 2.0;
-	inFl += 1.0;
+// Exact round(sqrt(x)) without fp64: a single-precision estimate corrected to the
+// exact integer floor, then rounded. Lets the kernel build on OpenCL stacks that
+// lack cl_khr_fp64 (e.g. rusticl/Mesa) while staying bit-identical on ROCm. Inputs
+// are triangular indices (< ~2^26), well within range for the float estimate +
+// integer correction.
+inline uint isqrt_round(ulong x) {
+	long m = (long) sqrt((float) x);
+	while (m > 0 && (ulong)(m * m) > x) m--;       // correct down to floor(sqrt)
+	while ((ulong)((m + 1) * (m + 1)) <= x) m++;   // correct up to floor(sqrt)
+	// round to nearest: round up iff the fractional part is >= 0.5.
+	return (uint)(((x - (ulong)(m * m)) > (ulong) m) ? (m + 1) : m);
+}
 
-	uint2 res; 
-	res.s0 = (uint) round(sqrt(inFl));
+uint2 decompress(uint2 in) {
+	uint2 res;
+	res.s0 = isqrt_round(2ul * (ulong)(in.s0 >> 6) + 1ul);
 
 
 	uint tmp = res.s0 * (res.s0-1);
@@ -535,13 +541,8 @@ uint2 decompress(uint2 in) {
 }
 
 uint2 decompress2(uint in) {
-	double inFl = (double) in;
-	
-	inFl *= 2.0;
-	inFl += 1.0;
-
-	uint2 res; 
-	res.s0 = (uint) round(sqrt(inFl));
+	uint2 res;
+	res.s0 = isqrt_round(2ul * (ulong) in + 1ul);
 
 
 	uint tmp = res.s0 * (res.s0-1);
